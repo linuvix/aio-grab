@@ -895,14 +895,18 @@ static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *
 	argv[n++] = "-loglevel";
 	argv[n++] = (char *)loglevel;
 	if (grab_ffmpeg_http_headers[0]) { argv[n++] = "-headers"; argv[n++] = grab_ffmpeg_http_headers; }
-	/* Still-grab tuning: Vavoo needs a bigger probe to find the IDR,
-	 * but direct IPTV (Samsung, etc.) has multiple manifests that
-	 * ffmpeg downloads in full if probesize is too big.
-	 * 256K/0 is enough for direct IPTV; Vavoo gets 1M/1s. */
+	/* Still-grab tuning.
+	 * - Vavoo (4323): keep the previously-tuned 1M/1s values.
+	 * - YouTube / generic HLS IPTV: needs a much larger probe and
+	 *   analysis window or ffmpeg will return a black first frame.
+	 * - DVB-S/C/T: local TS, 1M/1s is plenty. */
 	int is_iptv = grab_current_service_is_iptv();
-	if (is_iptv && !strstr(input, "4323")) {
-		argv[n++] = "-probesize";       argv[n++] = "262144";
-		argv[n++] = "-analyzeduration"; argv[n++] = "0";
+	if (is_iptv && strstr(input, "4323")) {
+		argv[n++] = "-probesize";       argv[n++] = "1048576";
+		argv[n++] = "-analyzeduration"; argv[n++] = "1000000";
+	} else if (is_iptv) {
+		argv[n++] = "-probesize";       argv[n++] = "5000000";
+		argv[n++] = "-analyzeduration"; argv[n++] = "10000000";
 	} else {
 		argv[n++] = "-probesize";       argv[n++] = "1048576";
 		argv[n++] = "-analyzeduration"; argv[n++] = "1000000";
@@ -910,11 +914,13 @@ static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *
 	argv[n++] = "-fflags";          argv[n++] = "nobuffer";
 	/* -flags low_delay removed: DM920's ffmpeg emits a black first
 	 * frame for HEVC when it's set. */
-	/* Give slow providers (Stalker/bossco) enough time to send the first
-	 * frame without triggering a full grab retry, and use more threads
-	 * for 4K HEVC decoding. */
-	argv[n++] = "-rw_timeout";      argv[n++] = "8000000";
-	argv[n++] = "-t";               argv[n++] = "10";
+	/* Give slow providers (YouTube/HLS, Stalker/bossco) enough time to
+	 * send the first frame without triggering a full grab retry, and
+	 * use more threads for 4K HEVC decoding.
+	 * -rw_timeout is a *maximum* wait: fast streams still return in
+	 * well under a second, so this cannot slow down healthy DVB/Vavoo. */
+	argv[n++] = "-rw_timeout";      argv[n++] = "20000000";
+	argv[n++] = "-t";               argv[n++] = "15";
 	argv[n++] = "-threads";         argv[n++] = "4";
 	argv[n++] = "-filter_threads";  argv[n++] = "4";
 	argv[n++] = "-an"; argv[n++] = "-sn"; argv[n++] = "-dn";
