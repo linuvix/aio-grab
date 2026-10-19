@@ -895,12 +895,18 @@ static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *
 	argv[n++] = "-loglevel";
 	argv[n++] = (char *)loglevel;
 	if (grab_ffmpeg_http_headers[0]) { argv[n++] = "-headers"; argv[n++] = grab_ffmpeg_http_headers; }
-	/* Still-grab tuning: 1M probe / 1s analyse is 5x faster than the
-	 * 5M/5s defaults but still enough for a cold 4K HEVC HTTP stream
-	 * to find PAT/PMT + first IDR. 128K/0 caused EIO on jmp2.uk-class
-	 * redirectors. */
-	argv[n++] = "-probesize";       argv[n++] = "1048576";
-	argv[n++] = "-analyzeduration"; argv[n++] = "1000000";
+	/* Still-grab tuning: Vavoo needs a bigger probe to find the IDR,
+	 * but direct IPTV (Samsung, etc.) has multiple manifests that
+	 * ffmpeg downloads in full if probesize is too big.
+	 * 256K/0 is enough for direct IPTV; Vavoo gets 1M/1s. */
+	int is_iptv = grab_current_service_is_iptv();
+	if (is_iptv && !strstr(input, "4323")) {
+		argv[n++] = "-probesize";       argv[n++] = "262144";
+		argv[n++] = "-analyzeduration"; argv[n++] = "0";
+	} else {
+		argv[n++] = "-probesize";       argv[n++] = "1048576";
+		argv[n++] = "-analyzeduration"; argv[n++] = "1000000";
+	}
 	argv[n++] = "-fflags";          argv[n++] = "nobuffer";
 	/* -flags low_delay removed: DM920's ffmpeg emits a black first
 	 * frame for HEVC when it's set. */
