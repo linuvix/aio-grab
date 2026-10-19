@@ -910,10 +910,13 @@ static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *
 	argv[n++] = "-fflags";          argv[n++] = "nobuffer";
 	/* -flags low_delay removed: DM920's ffmpeg emits a black first
 	 * frame for HEVC when it's set. */
-	argv[n++] = "-rw_timeout";      argv[n++] = "4000000";
-	argv[n++] = "-t";               argv[n++] = "6";
-	argv[n++] = "-threads";         argv[n++] = "2";
-	argv[n++] = "-filter_threads";  argv[n++] = "2";
+	/* Give slow providers (Stalker/bossco) enough time to send the first
+	 * frame without triggering a full grab retry, and use more threads
+	 * for 4K HEVC decoding. */
+	argv[n++] = "-rw_timeout";      argv[n++] = "8000000";
+	argv[n++] = "-t";               argv[n++] = "10";
+	argv[n++] = "-threads";         argv[n++] = "4";
+	argv[n++] = "-filter_threads";  argv[n++] = "4";
 	argv[n++] = "-an"; argv[n++] = "-sn"; argv[n++] = "-dn";
 	if (add_nokey) { argv[n++] = "-skip_frame"; argv[n++] = "nokey"; }
 	argv[n++] = "-i"; argv[n++] = (char *)input;
