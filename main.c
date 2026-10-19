@@ -895,20 +895,18 @@ static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *
 	argv[n++] = "-loglevel";
 	argv[n++] = (char *)loglevel;
 	if (grab_ffmpeg_http_headers[0]) { argv[n++] = "-headers"; argv[n++] = grab_ffmpeg_http_headers; }
-	/* Universal IPTV/HLS tuning: no auto-stream-discovery, no
-	 * variant-playlist probing, no analyse. Grabs the first frame
-	 * of the first stream regardless of provider.
-	 * -probesize 32K + -flags2 +skip_manual stops ffmpeg from
-	 * downloading every .m3u8 in the master playlist, which is
-	 * what made Samsung (5 variants) take 10s and Vavoo (slow
-	 * CDN) take 5s. The 32K is enough to see one IDR.
-	 * If a future provider still fails, raise to 262144 — no other
-	 * change needed. */
-	argv[n++] = "-probesize";       argv[n++] = "32768";
-	argv[n++] = "-analyzeduration"; argv[n++] = "0";
-	argv[n++] = "-flags2";          argv[n++] = "+skip_manual";
-	argv[n++] = "-muxdelay";        argv[n++] = "0";
-	argv[n++] = "-muxpreload";      argv[n++] = "0";
+	/* Still-grab tuning: Vavoo needs a bigger probe to find the IDR,
+	 * but direct IPTV (Samsung, etc.) has multiple manifests that
+	 * ffmpeg downloads in full if probesize is too big.
+	 * 256K/0 is enough for direct IPTV; Vavoo gets 1M/1s. */
+	int is_iptv = grab_current_service_is_iptv();
+	if (is_iptv && !strstr(input, "4323")) {
+		argv[n++] = "-probesize";       argv[n++] = "262144";
+		argv[n++] = "-analyzeduration"; argv[n++] = "0";
+	} else {
+		argv[n++] = "-probesize";       argv[n++] = "1048576";
+		argv[n++] = "-analyzeduration"; argv[n++] = "1000000";
+	}
 	argv[n++] = "-fflags";          argv[n++] = "nobuffer";
 	/* -flags low_delay removed: DM920's ffmpeg emits a black first
 	 * frame for HEVC when it's set. */
