@@ -511,16 +511,48 @@ static int grab_extract_embedded_stream_url(const char *sref, char *out, size_t 
 	return -1;
 }
 
+static int grab_is_iptv_reftype(const char *sref)
+{
+	/* E2 service-reference FIRST field is the service type.
+	 * IPTV variants: 4097 (extplayer), 5001/5002 (gstplayer/exteplayer3),
+	 * 8739 (streamlink).
+	 * Example: "4097:0:1:C2:C3:C3:14DD1:0:0:0:http%3a//..." */
+	if (!sref) return 0;
+	return !strncmp(sref, "4097:", 5) || !strncmp(sref, "5001:", 5) ||
+	       !strncmp(sref, "5002:", 5) || !strncmp(sref, "8739:", 5);
+}
+
 static int grab_normalize_stream_input(const char *in, char *out, size_t out_len)
 {
 	char tmp[4096];
 	char direct[4096];
+	int is_iptv_reftype = 0;
 	if (!in || !*in || !out || out_len == 0) return -1;
 	grab_ffmpeg_reset_input_opts();
+
+	/* Decide early: is the raw service reference an IPTV reftype?
+	 * Do this BEFORE any decoding/unescaping so we can prefer the local
+	 * Enigma2 relay for IPTV and avoid the provider's per-request token. */
+	is_iptv_reftype = grab_is_iptv_reftype(in);
+
 	snprintf(tmp, sizeof(tmp), "%s", in);
 	grab_xml_unescape_inplace(tmp);
 	snprintf(direct, sizeof(direct), "%s", tmp);
 	grab_percent_decode_repeat_inplace(direct, 4);
+
+	/* IPTV reftype -> local relay. Enigma2's stream server is already
+	 * connected to the provider and holds a keyframe, so ffmpeg gets a
+	 * picture in <1s instead of a cold connect + keyframe wait.
+	 * Escape hatch: if /tmp/grab_direct_provider exists, skip the relay
+	 * and fall through to the old provider-URL behaviour (for the rare
+	 * provider whose stream Enigma2's relay can't fetch). */
+	if (is_iptv_reftype && access("/tmp/grab_direct_provider", F_OK) != 0)
+	{
+		snprintf(out, out_len, "http://127.0.0.1:8001/%s", in);
+		if (!quiet) fprintf(stderr, "ffmpeg backend: IPTV reftype -> local relay\n");
+		return 0;
+	}
+
 	if (!strncmp(direct, "http://", 7) || !strncmp(direct, "https://", 8))
 	{ grab_parse_iptv_url_options_inplace(direct); snprintf(out, out_len, "%s", direct); return 0; }
 	if (!strncmp(direct, "file:", 5) || direct[0] == '/')
@@ -797,10 +829,11 @@ static const char *grab_ffmpeg_loglevel(void)
 
 static void grab_make_ffmpeg_scale_fast(char *dst, size_t dst_len, int out_w, int out_h, int frame_mode)
 {
-	if (frame_mode == GRAB_FFMPEG_FRAME_WAIT)
-		snprintf(dst, dst_len, "fps=1/2,scale=%d:%d:flags=fast_bilinear,format=bgr24", out_w, out_h);
-	else
-		snprintf(dst, dst_len, "scale=%d:%d:flags=fast_bilinear,format=bgr24", out_w, out_h);
+	(void)frame_mode;
+	/* No fps filter. For a single still we want the very next frame,
+	 * not a half-second tick. `fps=1/2` alone used to cost 4-8s on UHD
+	 * IPTV because of long GOPs. */
+	snprintf(dst, dst_len, "scale=%d:%d:flags=fast_bilinear,format=bgr24", out_w, out_h);
 }
 
 static int grab_run_argv_capture_stdout(char *const argv[], unsigned char *buf, size_t need)
@@ -864,14 +897,24 @@ static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *
 	if (need == 0 || need > 1920U * 1080U * 3U) return -1;
 	grab_make_ffmpeg_scale_fast(vf, sizeof(vf), out_w, out_h, frame_mode);
 	if (frame_mode == GRAB_FFMPEG_FRAME_KEYONLY) add_nokey = 1;
-	else if (frame_mode == GRAB_FFMPEG_FRAME_WAIT &&
-	         grab_current_service_is_iptv() && grab_current_video_is_hevc()) add_nokey = 1;
+	else if (grab_current_service_is_iptv() && grab_current_video_is_hevc()) add_nokey = 1;
 	argv[n++] = "/usr/bin/ffmpeg";
 	argv[n++] = "-hide_banner";
 	argv[n++] = "-nostdin";
 	argv[n++] = "-loglevel";
 	argv[n++] = (char *)loglevel;
 	if (grab_ffmpeg_http_headers[0]) { argv[n++] = "-headers"; argv[n++] = grab_ffmpeg_http_headers; }
+	/* Still-grab tuning: tiny probe, no analyse, no buffer, bounded runtime.
+	 * On the DM920 (armhf) the defaults cost 3-5s before a single frame
+	 * is even decoded. 128K/0 is plenty for a live stream. */
+	argv[n++] = "-probesize";       argv[n++] = "131072";
+	argv[n++] = "-analyzeduration"; argv[n++] = "0";
+	argv[n++] = "-fflags";          argv[n++] = "nobuffer";
+	argv[n++] = "-flags";           argv[n++] = "low_delay";
+	argv[n++] = "-rw_timeout";      argv[n++] = "4000000";
+	argv[n++] = "-t";               argv[n++] = "6";
+	argv[n++] = "-threads";         argv[n++] = "2";
+	argv[n++] = "-filter_threads";  argv[n++] = "2";
 	argv[n++] = "-an"; argv[n++] = "-sn"; argv[n++] = "-dn";
 	if (add_nokey) { argv[n++] = "-skip_frame"; argv[n++] = "nokey"; }
 	argv[n++] = "-i"; argv[n++] = (char *)input;
@@ -910,23 +953,21 @@ static int grab_ffmpeg_getvideo_frame(unsigned char *video, int *xres, int *yres
 		        out_w, out_h, grab_ffmpeg_http_headers[0] ? " headers=yes" : "");
 	if (grab_current_video_is_hevc())
 	{
-		if (!quiet) fprintf(stderr, "ffmpeg backend: HEVC stream, key-frame path first\n");
+		if (!quiet) fprintf(stderr, "ffmpeg backend: HEVC stream, key-frame path\n");
 		ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_KEYONLY);
-		if (ret < 0) { if (!quiet) fprintf(stderr, "ffmpeg backend: key-frame failed, retrying fps=1/2\n");
-			ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_WAIT); }
+		if (ret < 0) {
+			if (!quiet) fprintf(stderr, "ffmpeg backend: key-frame path failed, one retry\n");
+			ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_KEYONLY);
+		}
 	}
 	else if (grab_current_service_is_iptv())
 	{
-		if (!quiet) fprintf(stderr, "ffmpeg backend: IPTV, fps=1/2 wait mode first\n");
-		ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_WAIT);
-		if (ret < 0) { if (!quiet) fprintf(stderr, "ffmpeg backend: wait mode failed, retrying fast\n");
-			ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_FAST); }
+		if (!quiet) fprintf(stderr, "ffmpeg backend: IPTV, single-frame grab\n");
+		ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_FAST);
 	}
 	else
 	{
 		ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_FAST);
-		if (ret < 0) { if (!quiet) fprintf(stderr, "ffmpeg backend: fast frame failed, retrying fps=1/2\n");
-			ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_WAIT); }
 	}
 	if (ret == 0) { if (xres) *xres = out_w; if (yres) *yres = out_h; }
 	return ret;
