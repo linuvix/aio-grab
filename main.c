@@ -526,32 +526,16 @@ static int grab_normalize_stream_input(const char *in, char *out, size_t out_len
 {
 	char tmp[4096];
 	char direct[4096];
-	int is_iptv_reftype = 0;
 	if (!in || !*in || !out || out_len == 0) return -1;
 	grab_ffmpeg_reset_input_opts();
 
 	/* Decide early: is the raw service reference an IPTV reftype?
 	 * Do this BEFORE any decoding/unescaping so we can prefer the local
 	 * Enigma2 relay for IPTV and avoid the provider's per-request token. */
-	is_iptv_reftype = grab_is_iptv_reftype(in);
-
 	snprintf(tmp, sizeof(tmp), "%s", in);
 	grab_xml_unescape_inplace(tmp);
 	snprintf(direct, sizeof(direct), "%s", tmp);
 	grab_percent_decode_repeat_inplace(direct, 4);
-
-	/* IPTV reftype -> local relay. Enigma2's stream server is already
-	 * connected to the provider and holds a keyframe, so ffmpeg gets a
-	 * picture in <1s instead of a cold connect + keyframe wait.
-	 * Escape hatch: if /tmp/grab_direct_provider exists, skip the relay
-	 * and fall through to the old provider-URL behaviour (for the rare
-	 * provider whose stream Enigma2's relay can't fetch). */
-	if (is_iptv_reftype && access("/tmp/grab_direct_provider", F_OK) != 0)
-	{
-		snprintf(out, out_len, "http://127.0.0.1:8001/%s", in);
-		if (!quiet) fprintf(stderr, "ffmpeg backend: IPTV reftype -> local relay\n");
-		return 0;
-	}
 
 	if (!strncmp(direct, "http://", 7) || !strncmp(direct, "https://", 8))
 	{ grab_parse_iptv_url_options_inplace(direct); snprintf(out, out_len, "%s", direct); return 0; }
