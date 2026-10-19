@@ -880,8 +880,15 @@ static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *
 	need = (size_t)out_w * (size_t)out_h * 3U;
 	if (need == 0 || need > 1920U * 1080U * 3U) return -1;
 	grab_make_ffmpeg_scale_fast(vf, sizeof(vf), out_w, out_h, frame_mode);
-	if (frame_mode == GRAB_FFMPEG_FRAME_KEYONLY) add_nokey = 1;
-	else if (grab_current_service_is_iptv() && grab_current_video_is_hevc()) add_nokey = 1;
+	/* -skip_frame nokey is NOT used for HEVC grabs.
+	 * Vavoo/HLS providers serve segments where the keyframe is not at
+	 * the segment boundary; ffmpeg would have to burn through multiple
+	 * .ts segments (~6-10s) waiting for the first IDR.  Decoding the
+	 * first available P-frame gives us a usable picture in <1s.  The
+	 * only downside is a possibly-slightly-torn first frame, which is
+	 * acceptable for a still-grab.  Do NOT re-enable this. */
+	(void)frame_mode;
+	add_nokey = 0;
 	argv[n++] = "/usr/bin/ffmpeg";
 	argv[n++] = "-hide_banner";
 	argv[n++] = "-nostdin";
