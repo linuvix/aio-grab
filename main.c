@@ -967,8 +967,11 @@ static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *
 		argv[n++] = "-probesize";       argv[n++] = "1048576";
 		argv[n++] = "-analyzeduration"; argv[n++] = "1000000";
 	} else if (is_iptv) {
-		argv[n++] = "-probesize";       argv[n++] = "5000000";
-		argv[n++] = "-analyzeduration"; argv[n++] = "10000000";
+		/* Reduced from 5M/10s to 1M/1s to speed up 4K IPTV grabs.
+		 * If you get black screens again on specific providers, 
+		 * bump analyzeduration to 3000000 (3s) or 5000000 (5s). */
+		argv[n++] = "-probesize";       argv[n++] = "1048576";
+		argv[n++] = "-analyzeduration"; argv[n++] = "1000000";
 	} else {
 		argv[n++] = "-probesize";       argv[n++] = "1048576";
 		argv[n++] = "-analyzeduration"; argv[n++] = "1000000";
