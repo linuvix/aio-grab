@@ -375,17 +375,21 @@ static int grab_extract_xml_tag(const char *xml, const char *tag, char *out, siz
 	return out[0] ? 0 : -1;
 }
 
-static const char *grab_find_earliest_url_marker(const char *s)
+static const char *grab_find_earliest_url_marker(const char *s, int *encoded_marker)
 {
 	const char *markers[] = { "http://", "https://", "http%3a//", "https%3a//" };
+	const int encoded[]   = { 0, 0, 1, 1 };
 	const char *best = NULL;
+	int best_encoded = 0;
 	unsigned int i;
+	if (encoded_marker) *encoded_marker = 0;
 	if (!s) return NULL;
 	for (i = 0; i < sizeof(markers) / sizeof(markers[0]); ++i)
 	{
 		const char *p = strcasestr(s, markers[i]);
-		if (p && (!best || p < best)) best = p;
+		if (p && (!best || p < best)) { best = p; best_encoded = encoded[i]; }
 	}
+	if (encoded_marker) *encoded_marker = best_encoded;
 	return best;
 }
 
@@ -456,38 +460,70 @@ static void grab_parse_iptv_url_options_inplace(char *url)
 	}
 }
 
-static void grab_cut_service_name_suffix_inplace(char *url)
+static void grab_cut_encoded_url_field_inplace(char *url)
+{
+	/*
+	 * Enigma2 IPTV references usually store the stream URL as one colon field,
+	 * e.g. 4097:...:http%3a//host%3a8080/path:Service Name.
+	 * The scheme and URL-internal colons are percent encoded, so the first
+	 * literal colon after the marker terminates the URL field.
+	 */
+	while (url && *url)
+	{
+		if (*url == ':')
+		{
+			char *q = url + 1;
+			/* Be tolerant of references where only the scheme colon is encoded
+			 * but a URL port is left plain, e.g. http%3a//host:8080/path. */
+			if (isdigit((unsigned char)*q))
+			{
+				while (isdigit((unsigned char)*q))
+					++q;
+				if (*q == '/' || *q == '?' || *q == '&' || *q == '#' || *q == 0)
+				{
+					url = q;
+					continue;
+				}
+			}
+			*url = 0;
+			return;
+		}
+		++url;
+	}
+}
+
+static void grab_cut_plain_embedded_url_inplace(char *url)
 {
 	char *p;
-	char *last_colon = NULL;
-	if (!url) return;
-	for (p = url; *p; ++p)
+
+	if (!url)
+		return;
+	p = strstr(url, "://");
+	if (!p)
+		return;
+	p += 3;
+
+	while (*p)
 	{
-		if (*p != ':') continue;
-		if (p[1] == '/' && p[2] == '/') { p += 2; continue; }
-		if (isdigit((unsigned char)p[1]))
+		if (*p == ':')
 		{
 			char *q = p + 1;
-			while (isdigit((unsigned char)*q)) ++q;
-			if (*q == '/' || *q == '?' || *q == '&' || *q == '#' || *q == 0) { p = q - 1; continue; }
+			/* Keep a normal URL port such as http://host:8080/path. */
+			if (isdigit((unsigned char)*q))
+			{
+				while (isdigit((unsigned char)*q))
+					++q;
+				if (*q == '/' || *q == '?' || *q == '&' || *q == '#' || *q == 0)
+				{
+					p = q;
+					continue;
+				}
+			}
+			/* Otherwise this is most likely the service-name delimiter. */
+			*p = 0;
+			return;
 		}
-		{
-			char *q = p + 1;
-			int groups = 0;
-			while (isxdigit((unsigned char)q[0]) && isxdigit((unsigned char)q[1]) &&
-			       q[2] == ':' && isxdigit((unsigned char)q[3]) && isxdigit((unsigned char)q[4]))
-			{ q += 3; ++groups; }
-			if (groups >= 2) { p = q - 1; continue; }
-		}
-		if (p > url && p[-1] == ']') continue;
-		last_colon = p;
-	}
-	if (!last_colon) return;
-	{
-		char *tail = last_colon + 1;
-		if (tail[0] && !strchr(tail, '/') && !strchr(tail, '?') &&
-		    !strchr(tail, '&') && !strchr(tail, '#') && strlen(tail) < 64)
-			*last_colon = 0;
+		++p;
 	}
 }
 
@@ -496,18 +532,43 @@ static int grab_extract_embedded_stream_url(const char *sref, char *out, size_t 
 	char work[4096];
 	char url[2048];
 	const char *p;
-	if (!sref || !out || out_len == 0) return -1;
+	int encoded = 0;
+	int round;
+
+	if (!sref || !out || out_len == 0)
+		return -1;
+
+	/* OpenWebif can return IPTV service references double-encoded.  Stop
+	 * decoding as soon as the URL marker is recognizable: encoded colons
+	 * inside the URL and HTTP headers must remain distinguishable from the
+	 * literal colon separating the URL field from the service name. */
 	snprintf(work, sizeof(work), "%s", sref);
 	grab_xml_unescape_inplace(work);
-	grab_percent_decode_repeat_inplace(work, 4);
-	p = grab_find_earliest_url_marker(work);
-	if (!p) return -1;
+	p = grab_find_earliest_url_marker(work, &encoded);
+	for (round = 0; !p && round < 4; ++round)
+	{
+		if (!grab_percent_decode_once_inplace(work))
+			break;
+		p = grab_find_earliest_url_marker(work, &encoded);
+	}
+	if (!p)
+		return -1;
+
 	snprintf(url, sizeof(url), "%s", p);
+	if (encoded)
+		grab_cut_encoded_url_field_inplace(url);
+	else
+		grab_cut_plain_embedded_url_inplace(url);
+
 	grab_percent_decode_repeat_inplace(url, 4);
-	grab_cut_service_name_suffix_inplace(url);
 	grab_parse_iptv_url_options_inplace(url);
+
 	if (!strncmp(url, "http://", 7) || !strncmp(url, "https://", 8))
-	{ snprintf(out, out_len, "%s", url); return 0; }
+	{
+		snprintf(out, out_len, "%s", url);
+		return 0;
+	}
+
 	return -1;
 }
 
@@ -737,7 +798,7 @@ static int grab_current_service_is_iptv(void)
 		snprintf(work, sizeof(work), "%s", sref);
 		grab_xml_unescape_inplace(work);
 		grab_percent_decode_repeat_inplace(work, 4);
-		if (grab_find_earliest_url_marker(work) != NULL) return 1;
+		if (grab_find_earliest_url_marker(work, NULL) != NULL) return 1;
 		{
 			const char *p = sref, *q;
 			int idx = 0;
@@ -761,9 +822,9 @@ static int grab_current_service_is_iptv(void)
 		snprintf(work, sizeof(work), "%s", input_file);
 		grab_xml_unescape_inplace(work);
 		grab_percent_decode_repeat_inplace(work, 4);
-		if (grab_find_earliest_url_marker(work) != NULL) return 1;
+		if (grab_find_earliest_url_marker(work, NULL) != NULL) return 1;
 	}
-	return 1;
+	return 0;
 }
 
 static int grab_current_video_is_dmnew_sd576(int w, int h)
@@ -774,27 +835,28 @@ static int grab_current_video_is_dmnew_sd576(int w, int h)
 static int grab_ffmpeg_backend_should_autouse(int *src_w, int *src_h)
 {
 	int w = 0, h = 0;
-	int hevc, dmnew_sd576;
+	int hevc;
+	int dmnew_sd576;
+
 	grab_read_current_video_size(&w, &h);
-	hevc = grab_current_video_is_hevc();
+	hevc        = grab_current_video_is_hevc();
 	dmnew_sd576 = grab_current_video_is_dmnew_sd576(w, h);
+
 	if (src_w) *src_w = w;
 	if (src_h) *src_h = h;
 
-	/* DVB-S/C/T and DreamOne/Two: UHD, HEVC, or DMNEW SD576 → ffmpeg */
+	/*
+	 * Native grabber for SD/HD/FHD H.264 (DVB and IPTV).
+	 * ffmpeg only for HEVC/H.265 or >1920x1080 (DVB and IPTV),
+	 * plus the DreamOne/Two SD576 corner case.
+	 *
+	 * DM900 (BRCM7439) and DM920 (BRCM7252S) share the same decoder
+	 * memory layout, so SD/HD/FHD H.264 IPTV stays native on both.
+	 * Opening a second ffmpeg stream connection just because the
+	 * service reference contains a URL is the bug fixed in d738134.
+	 */
 	if ((stb_type == BRCM7439 || stb_type == BRCM7252S || stb_type == DMNEW) &&
 	    (w > 1920 || h > 1080 || hevc || dmnew_sd576))
-		return 1;
-
-	/* IPTV: ONLY HEVC or UHD/4K goes to ffmpeg.
-	 * IPTV H.264 SD/HD/FHD stays on the native grabber, exactly as before.
-	 * The extra hevc/UHD check re-runs grab_current_video_is_hevc() (which
-	 * also inspects the service reference and /proc/stb/vmpeg/0/input) so
-	 * an IPTV HEVC stream is still routed to ffmpeg even if the codec file
-	 * is momentarily stale after a zap. */
-	if ((stb_type == BRCM7439 || stb_type == BRCM7252S || stb_type == DMNEW) &&
-	    grab_current_service_is_iptv() &&
-	    (grab_current_video_is_hevc() || w > 1920 || h > 1080))
 		return 1;
 
 	return 0;
@@ -2532,7 +2594,7 @@ int main(int argc, char **argv)
 			if ((src_w > 1920 || src_h > 1080) && (!width || width > 1920))
 				width = 1920;
 			if (!quiet)
-				fprintf(stderr, "Using ffmpeg backend for Dream HEVC/UHD/SD/IPTV video capture ...\n");
+				fprintf(stderr, "Using ffmpeg backend for Dream HEVC/UHD/SD video capture ...\n");
 		}
 	}
 
@@ -2595,7 +2657,7 @@ int main(int argc, char **argv)
 		if (use_ffmpeg_video_backend)
 		{
 			if (grab_ffmpeg_getvideo_frame(video, &xres_v, &yres_v, width, NULL) < 0)
-				fprintf(stderr, "ffmpeg backend failed; refusing unsafe raw HEVC/UHD/SD/IPTV video grab\n");
+				fprintf(stderr, "ffmpeg backend failed; refusing unsafe raw HEVC/UHD/SD video grab\n");
 		}
 		else if (stb_type == BRCM7366 || stb_type == BRCM7251 || stb_type == BRCM7252 || stb_type == BRCM7444 || stb_type == BRCM72604VU || stb_type == BRCM7278 || stb_type == HISIL_ARM)
 		{
