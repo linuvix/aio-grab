@@ -1,7 +1,26 @@
 /*
-AiO stb screengrabber — DM920 OpenPLi build with UHD/HEVC IPTV fixes
+AiO stb screengrabber
 
-Based on the work of Seddi / http://www.ihad.tv
+Based on the work of Seddi
+Contact: seddi@ihad.tv / http://www.ihad.tv
+
+This standalone binary will grab the video-picture convert it from
+yuv to rgb and resize it, if neccesary, to the same size as the framebuffer or
+vice versa. For the DM7025 (Xilleon) and DM800/DM8000/DM500HD (Broadcom) the video will be
+grabbed directly from the decoder memory.
+It also grabs the framebuffer picture in 32Bit, 16Bit or in 8Bit mode with the
+correct colortable in 8Bit mode from the main graphics memory, because the
+FBIOGETCMAP is buggy on Vulcan/Pallas boxes and didnt give you the correct color
+map.
+Finally it will combine the pixmaps to one final picture by using the framebuffer
+alphamap and save it as bmp, jpeg or png file. So you will get the same picture
+as you can see on your TV Screen.
+
+There are a few command line switches, use "grab -h" to get them listed.
+
+A special Thanx to tmbinc and ghost for the needed decoder memory information and
+the great support.
+
 Feel free to use the code for your own projects. See LICENSE file for details.
 */
 
@@ -24,14 +43,19 @@ Feel free to use the code for your own projects. See LICENSE file for details.
 #include <arpa/inet.h>
 #include <linux/types.h>
 #include <linux/fb.h>
+#include <linux/videodev2.h>
+#include <poll.h>
+#include <sys/stat.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <dlfcn.h>
 #include <dirent.h>
 #include <errno.h>
 #include <elf.h>
+#include <endian.h>
 
 #if defined(__sh__)
+#include <sys/time.h>
 #include <bpamem.h>
 #endif
 
@@ -39,27 +63,42 @@ Feel free to use the code for your own projects. See LICENSE file for details.
 #include "jpeglib.h"
 
 #if defined(__sh__)
+
 #define OUT(x) \
 	out[OUTITER]=(unsigned char)*(decode_surface + x)&0xFF; \
 	OUTITER+=OUTINC;
+
 #define OUT4(x) \
 	OUT(x + 0x03); \
 	OUT(x + 0x02); \
 	OUT(x + 0x01); \
 	OUT(x + 0x00);
+
 #define OUT8(x) \
 	OUT4(x + 0x04); \
 	OUT4(x + 0x00);
+
 #define OUT_LU_16A(x) \
 	OUT8(x); \
 	OUT8(x + 0x40);
+
 #define OUT_CH_8A(x) \
 	OUT4(x); \
 	OUT4(x + 0x20);
+
+//pppppppppppppppp
+//x: macroblock address
+//l: line 0-15
 #define OUT_LU_16(x,l) \
 	OUT_LU_16A(x + (l/4) * 0x10 + (l%2) * 0x80 + ((l/2)%2?0x00:0x08));
+
+//pppppppp
+//x: macroblock address
+//l: line 0-7
+//b: 0=cr 1=cb
 #define OUT_CH_8(x,l,b) \
 	OUT_CH_8A(x + (l/4) * 0x10 + (l%2) * 0x40 + ((l/2)%2?0x00:0x08) + (b?0x04:0x00));
+
 #endif
 
 #define CLAMP(x)    ((x < 0) ? 0 : ((x > 255) ? 255 : x))
@@ -77,6 +116,7 @@ Feel free to use the code for your own projects. See LICENSE file for details.
 #if defined(__sh__)
 int timeval_subtract (struct timeval *result, struct timeval *x, struct timeval *y)
 {
+	/* Perform the carry for the later subtraction by updating y. */
 	if (x->tv_usec < y->tv_usec) {
 		int nsec = (y->tv_usec - x->tv_usec) / 1000000 + 1;
 		y->tv_usec -= 1000000 * nsec;
@@ -87,8 +127,13 @@ int timeval_subtract (struct timeval *result, struct timeval *x, struct timeval 
 		y->tv_usec += 1000000 * nsec;
 		y->tv_sec -= nsec;
 	}
+
+	/* Compute the time remaining to wait.
+	  tv_usec is certainly positive. */
 	result->tv_sec = x->tv_sec - y->tv_sec;
 	result->tv_usec = x->tv_usec - y->tv_usec;
+
+	/* Return 1 if result is negative. */
 	return x->tv_sec < y->tv_sec;
 }
 #endif
@@ -100,9 +145,11 @@ int timeval_subtract (struct timeval *result, struct timeval *x, struct timeval 
 #define E2EGL_CAPTURE_MAX_HEIGHT 2160U
 #define E2EGL_CAPTURE_MAX_PIXELS (E2EGL_CAPTURE_MAX_WIDTH * E2EGL_CAPTURE_MAX_HEIGHT)
 
-#define SPARE_RAM 252*1024*1024
-#define DMA_BLOCKSIZE 0x3FF000
+// dont change SPARE_RAM and DMA_BLOCKSIZE until you really know what you are doing !!!
+#define SPARE_RAM 252*1024*1024 // the last 4 MB is enough...
+#define DMA_BLOCKSIZE 0x3FF000 // should be big enough to hold a complete YUV 1920x1080 HD picture, otherwise it will not work properly on DM8000
 
+// static lookup tables for faster yuv2rgb conversion
 static const int yuv2rgbtable_y[256] = {
 0xFFED5EA0, 0xFFEE88B6, 0xFFEFB2CC, 0xFFF0DCE2, 0xFFF206F8, 0xFFF3310E, 0xFFF45B24, 0xFFF5853A, 0xFFF6AF50, 0xFFF7D966, 0xFFF9037C, 0xFFFA2D92, 0xFFFB57A8, 0xFFFC81BE, 0xFFFDABD4, 0xFFFED5EA, 0x0, 0x12A16, 0x2542C, 0x37E42, 0x4A858, 0x5D26E, 0x6FC84, 0x8269A, 0x950B0, 0xA7AC6, 0xBA4DC, 0xCCEF2, 0xDF908, 0xF231E, 0x104D34, 0x11774A, 0x12A160, 0x13CB76, 0x14F58C, 0x161FA2, 0x1749B8, 0x1873CE, 0x199DE4, 0x1AC7FA, 0x1BF210, 0x1D1C26, 0x1E463C, 0x1F7052, 0x209A68, 0x21C47E, 0x22EE94, 0x2418AA, 0x2542C0, 0x266CD6, 0x2796EC, 0x28C102, 0x29EB18, 0x2B152E, 0x2C3F44, 0x2D695A, 0x2E9370, 0x2FBD86, 0x30E79C, 0x3211B2, 0x333BC8, 0x3465DE, 0x358FF4, 0x36BA0A, 0x37E420, 0x390E36, 0x3A384C, 0x3B6262, 0x3C8C78, 0x3DB68E, 0x3EE0A4, 0x400ABA, 0x4134D0, 0x425EE6, 0x4388FC, 0x44B312, 0x45DD28, 0x47073E, 0x483154, 0x495B6A, 0x4A8580, 0x4BAF96, 0x4CD9AC, 0x4E03C2, 0x4F2DD8, 0x5057EE, 0x518204, 0x52AC1A, 0x53D630, 0x550046, 0x562A5C, 0x575472, 0x587E88, 0x59A89E, 0x5AD2B4, 0x5BFCCA, 0x5D26E0, 0x5E50F6, 0x5F7B0C, 0x60A522, 0x61CF38, 0x62F94E, 0x642364, 0x654D7A, 0x667790, 0x67A1A6, 0x68CBBC, 0x69F5D2, 0x6B1FE8, 0x6C49FE, 0x6D7414, 0x6E9E2A, 0x6FC840, 0x70F256, 0x721C6C, 0x734682, 0x747098, 0x759AAE, 0x76C4C4, 0x77EEDA, 0x7918F0, 0x7A4306, 0x7B6D1C, 0x7C9732, 0x7DC148, 0x7EEB5E, 0x801574, 0x813F8A, 0x8269A0, 0x8393B6, 0x84BDCC, 0x85E7E2, 0x8711F8, 0x883C0E, 0x896624, 0x8A903A, 0x8BBA50, 0x8CE466, 0x8E0E7C, 0x8F3892, 0x9062A8, 0x918CBE, 0x92B6D4, 0x93E0EA, 0x950B00, 0x963516, 0x975F2C, 0x988942, 0x99B358, 0x9ADD6E, 0x9C0784, 0x9D319A, 0x9E5BB0, 0x9F85C6, 0xA0AFDC, 0xA1D9F2, 0xA30408, 0xA42E1E, 0xA55834, 0xA6824A, 0xA7AC60, 0xA8D676, 0xAA008C, 0xAB2AA2, 0xAC54B8, 0xAD7ECE, 0xAEA8E4, 0xAFD2FA, 0xB0FD10, 0xB22726, 0xB3513C, 0xB47B52, 0xB5A568, 0xB6CF7E, 0xB7F994, 0xB923AA, 0xBA4DC0, 0xBB77D6, 0xBCA1EC, 0xBDCC02, 0xBEF618, 0xC0202E, 0xC14A44, 0xC2745A, 0xC39E70, 0xC4C886, 0xC5F29C, 0xC71CB2, 0xC846C8, 0xC970DE, 0xCA9AF4, 0xCBC50A, 0xCCEF20, 0xCE1936, 0xCF434C, 0xD06D62, 0xD19778, 0xD2C18E, 0xD3EBA4, 0xD515BA, 0xD63FD0, 0xD769E6, 0xD893FC, 0xD9BE12, 0xDAE828, 0xDC123E, 0xDD3C54, 0xDE666A, 0xDF9080, 0xE0BA96, 0xE1E4AC, 0xE30EC2, 0xE438D8, 0xE562EE, 0xE68D04, 0xE7B71A, 0xE8E130, 0xEA0B46, 0xEB355C, 0xEC5F72, 0xED8988, 0xEEB39E, 0xEFDDB4, 0xF107CA, 0xF231E0, 0xF35BF6, 0xF4860C, 0xF5B022, 0xF6DA38, 0xF8044E, 0xF92E64, 0xFA587A, 0xFB8290, 0xFCACA6, 0xFDD6BC, 0xFF00D2, 0x1002AE8, 0x10154FE, 0x1027F14, 0x103A92A, 0x104D340, 0x105FD56, 0x107276C, 0x1085182, 0x1097B98, 0x10AA5AE, 0x10BCFC4, 0x10CF9DA, 0x10E23F0, 0x10F4E06, 0x110781C, 0x111A232, 0x112CC48, 0x113F65E, 0x1152074, 0x1164A8A
 };
@@ -125,21 +172,25 @@ static int hisi_uses_composited_snapshot(void);
 void getvideo(unsigned char *video, int *xres, int *yres);
 void getvideo2(unsigned char *video, int *xres, int *yres);
 void getosd(unsigned char *osd, int *xres, int *yres);
-void smooth_resize(const unsigned char *source, unsigned char *dest, int xsource, int ysource, int xdest, int ydest, int colors);
+void smooth_resize(const unsigned char *source, unsigned char *dest, int xsource, int ysource, int xdest, int ydest, int colors); 
 void fast_resize(const unsigned char *source, unsigned char *dest, int xsource, int ysource, int xdest, int ydest, int colors);
 void (*resize)(const unsigned char *source, unsigned char *dest, int xsource, int ysource, int xdest, int ydest, int colors);
 void combine(unsigned char *output, const unsigned char *video, const unsigned char *osd, int vleft, int vtop, int vwidth, int vheight, int xres, int yres);
 
 static int grab_ffmpeg_backend_should_autouse(int *src_w, int *src_h);
+static int grab_ffmpeg_snapshot(const char *filename, int video_only, int osd_only, int width, int use_png, int use_jpg, int jpg_quality, const char *input_override);
 static int grab_ffmpeg_getvideo_frame(unsigned char *video, int *xres, int *yres, int width, const char *input_override);
 
+#if !defined(__sh__)
 static enum {UNKNOWN, DMNEW, WETEK, AZBOX863x, AZBOX865x, PALLAS, VULCAN, XILLEON, BRCM7400, BRCM7401, BRCM7405, BRCM7325, BRCM7335, BRCM7346, BRCM7358, BRCM7362, BRCM7241, BRCM7251, BRCM7252, BRCM7252S, BRCM7356, BRCM7424, BRCM7425, BRCM7435, BRCM7444, BRCM7552, BRCM7581, BRCM7583, BRCM7584, BRCM72604VU, BRCM72604, BRCM7278, BRCM75845, BRCM7366, BRCM73625, BRCM73565, BRCM7439DAGS, BRCM7439, HISIL_ARM, HISI_3716MV410, HISI_3716MV430, HISI_3798CV200, HISI_3798MV200, HISI_3798MV300} stb_type = UNKNOWN;
+#else
+static enum {UNKNOWN, DMNEW, WETEK, AZBOX863x, AZBOX865x, ST, PALLAS, VULCAN, XILLEON, BRCM7400, BRCM7401, BRCM7405, BRCM7325, BRCM7335, BRCM7346, BRCM7358, BRCM7362, BRCM7241, BRCM7251, BRCM7252, BRCM7252S, BRCM7356, BRCM7424, BRCM7425, BRCM7435, BRCM7444, BRCM7552, BRCM7581, BRCM7583, BRCM7584, BRCM72604VU, BRCM72604, BRCM7278, BRCM75845, BRCM7366, BRCM73625, BRCM73565, BRCM7439DAGS, BRCM7439, HISIL_ARM, HISI_3716MV410, HISI_3716MV430, HISI_3798CV200, HISI_3798MV200, HISI_3798MV300} stb_type = UNKNOWN;
+#endif
 
 static int stb_supports_uhd_grab_buffers(void)
 {
 	return stb_type == DMNEW ||
-	       stb_type == BRCM7439 ||
-	       stb_type == BRCM7252S ||
+	       stb_type == BRCM7439 ||      /* Dreambox DM900/DM920 */
 	       stb_type == BRCM7439DAGS ||
 	       stb_type == BRCM72604 ||
 	       stb_type == BRCM72604VU;
@@ -158,7 +209,15 @@ static int quiet = 0;
 static int video_dev = 0;
 static char grab_ffmpeg_http_headers[1024];
 
+/*
+ * Runtime request flags used by HiSilicon backends.  Some HI3798
+ * generations return an already hardware-composed display image from
+ * HI_UNF_DISP_AcquireSnapshot().  All-mode can use that composed
+ * snapshot directly; video-only needs the VO/window capture path to
+ * avoid framebuffer/OSD content.
+ */
 static int hisi_grab_request_video_only = 0;
+
 static void *hisi_lib_common = NULL;
 static void *hisi_lib_msp    = NULL;
 
@@ -187,38 +246,50 @@ struct videograbber_vframe_t {
 int zoomWidth(int width, int height, int aspect)
 {
 	int calculatedAspect = 256 * height / width;
+
 	if (aspect == calculatedAspect)
 		return width;
+
 	return 256 * height / aspect;
 }
+
 
 int readIntFromFile(const char *path, int base, int *out)
 {
 	FILE *file = fopen(path, "r");
 	if (!file)
 		return -1;
+
 	if (base == 10)
 		fscanf(file, "%d", out);
 	else if (base == 16)
 		fscanf(file, "%x", out);
 	else
 		return -1;
+
 	fclose(file);
+
 	return 0;
 }
 
+
+/* ---------------- AML helpers (PiG / MiniTV) ---------------- */
 static int aml_read_axis_(const char *path, int *L, int *T, int *R, int *B)
 {
 	FILE *f = fopen(path, "r");
 	if (!f)
 		return 0;
+
 	int l=0,t=0,r=-1,b=-1;
 	int ok = fscanf(f, "%d %d %d %d", &l, &t, &r, &b);
 	fclose(f);
+
 	if (ok != 4)
-		return 0;
+	return 0;
+	/* disabled: e.g. 0 0 -1 -1 */
 	if (r < l || b < t)
 		return 0;
+
 	*L=l; *T=t; *R=r; *B=b;
 	return 1;
 }
@@ -244,6 +315,19 @@ static inline void clamp_rect(int *L,int *T,int *W,int *H,int outW,int outH)
     if (*H < 1) *H = 1;
 }
 
+
+/*
+ * Automatic ffmpeg stream backend.
+ *
+ * Dream receivers only for now: DM900/DM920 (BRCM7439) and
+ * DreamOne/DreamTwo (DMNEW) can expose HEVC/UHD decoder surfaces in a
+ * hardware-private layout that is not safely readable as
+ * linear YUV from /dev/mem or /dev/videograbber.  DreamOS/FreezeFrame handles
+ * this by grabbing one decoded frame from the current service stream with
+ * ffmpeg.  IPTV service references are handled by extracting the embedded
+ * http(s) URL before falling back to the local 127.0.0.1:8001 service stream.
+ * Keep the logic inside grab so callers do not need a Python wrapper.
+ */
 static int grab_read_text_file(const char *path, char *buf, size_t len)
 {
 	FILE *f;
@@ -291,7 +375,10 @@ static int grab_percent_decode_once_inplace(char *s)
 	return changed;
 }
 
-static void grab_percent_decode_inplace(char *s) { (void)grab_percent_decode_once_inplace(s); }
+static void grab_percent_decode_inplace(char *s)
+{
+	(void)grab_percent_decode_once_inplace(s);
+}
 
 static void grab_percent_decode_repeat_inplace(char *s, int rounds)
 {
@@ -327,21 +414,31 @@ static int grab_http_get_local80(const char *path, char *out, size_t out_len)
 	size_t used = 0;
 	char *body;
 
-	if (!out || out_len < 2) return -1;
+	if (!out || out_len < 2)
+		return -1;
 	out[0] = 0;
 
 	fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (fd < 0) return -1;
+	if (fd < 0)
+		return -1;
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 	addr.sin_port = htons(80);
 	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(fd); return -1; }
+	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+	{
+		close(fd);
+		return -1;
+	}
 
 	snprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", path);
-	if (write(fd, req, strlen(req)) < 0) { close(fd); return -1; }
+	if (write(fd, req, strlen(req)) < 0)
+	{
+		close(fd);
+		return -1;
+	}
 
 	while (used + 1 < out_len && (r = read(fd, out + used, out_len - used - 1)) > 0)
 		used += (size_t)r;
@@ -349,7 +446,11 @@ static int grab_http_get_local80(const char *path, char *out, size_t out_len)
 	out[used] = 0;
 
 	body = strstr(out, "\r\n\r\n");
-	if (body) { body += 4; memmove(out, body, strlen(body) + 1); }
+	if (body)
+	{
+		body += 4;
+		memmove(out, body, strlen(body) + 1);
+	}
 	return used ? 0 : -1;
 }
 
@@ -358,16 +459,20 @@ static int grab_extract_xml_tag(const char *xml, const char *tag, char *out, siz
 	char open_tag[96], close_tag[96];
 	const char *p, *q;
 	size_t n;
-	if (!xml || !tag || !out || out_len == 0) return -1;
+	if (!xml || !tag || !out || out_len == 0)
+		return -1;
 	snprintf(open_tag, sizeof(open_tag), "<%s>", tag);
 	snprintf(close_tag, sizeof(close_tag), "</%s>", tag);
 	p = strstr(xml, open_tag);
-	if (!p) return -1;
+	if (!p)
+		return -1;
 	p += strlen(open_tag);
 	q = strstr(p, close_tag);
-	if (!q || q <= p) return -1;
+	if (!q || q <= p)
+		return -1;
 	n = (size_t)(q - p);
-	if (n >= out_len) n = out_len - 1;
+	if (n >= out_len)
+		n = out_len - 1;
 	memcpy(out, p, n);
 	out[n] = 0;
 	grab_xml_unescape_inplace(out);
@@ -378,37 +483,60 @@ static int grab_extract_xml_tag(const char *xml, const char *tag, char *out, siz
 static const char *grab_find_earliest_url_marker(const char *s, int *encoded_marker)
 {
 	const char *markers[] = { "http://", "https://", "http%3a//", "https%3a//" };
-	const int encoded[]   = { 0, 0, 1, 1 };
+	const int encoded[] = { 0, 0, 1, 1 };
 	const char *best = NULL;
 	int best_encoded = 0;
 	unsigned int i;
-	if (encoded_marker) *encoded_marker = 0;
-	if (!s) return NULL;
+
+	if (encoded_marker)
+		*encoded_marker = 0;
+	if (!s)
+		return NULL;
+
 	for (i = 0; i < sizeof(markers) / sizeof(markers[0]); ++i)
 	{
 		const char *p = strcasestr(s, markers[i]);
-		if (p && (!best || p < best)) { best = p; best_encoded = encoded[i]; }
+		if (p && (!best || p < best))
+		{
+			best = p;
+			best_encoded = encoded[i];
+		}
 	}
-	if (encoded_marker) *encoded_marker = best_encoded;
+
+	if (encoded_marker)
+		*encoded_marker = best_encoded;
 	return best;
 }
 
-static void grab_ffmpeg_reset_input_opts(void) { grab_ffmpeg_http_headers[0] = 0; }
+static void grab_ffmpeg_reset_input_opts(void)
+{
+	grab_ffmpeg_http_headers[0] = 0;
+}
 
 static int grab_strieq(const char *a, const char *b)
 {
-	if (!a || !b) return 0;
-	while (*a && *b) { if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0; ++a; ++b; }
+	if (!a || !b)
+		return 0;
+	while (*a && *b)
+	{
+		if (tolower((unsigned char)*a) != tolower((unsigned char)*b))
+			return 0;
+		++a;
+		++b;
+	}
 	return *a == 0 && *b == 0;
 }
 
 static void grab_trim_inplace(char *s)
 {
 	char *e;
-	if (!s) return;
-	while (*s && isspace((unsigned char)*s)) memmove(s, s + 1, strlen(s));
+	if (!s)
+		return;
+	while (*s && isspace((unsigned char)*s))
+		memmove(s, s + 1, strlen(s));
 	e = s + strlen(s);
-	while (e > s && isspace((unsigned char)e[-1])) *--e = 0;
+	while (e > s && isspace((unsigned char)e[-1]))
+		*--e = 0;
 }
 
 static void grab_append_http_header(const char *key, const char *value)
@@ -416,34 +544,56 @@ static void grab_append_http_header(const char *key, const char *value)
 	size_t used;
 	char safe_value[512];
 	char *p;
-	if (!key || !value || !*value) return;
-	if (!grab_strieq(key, "User-Agent") && !grab_strieq(key, "Accept") &&
-	    !grab_strieq(key, "Referer") && !grab_strieq(key, "Origin") &&
-	    !grab_strieq(key, "Cookie")) return;
+	if (!key || !value || !*value)
+		return;
+
+	/* Allow only headers that are commonly embedded in Enigma2 IPTV service
+	 * references.  Values are sanitized to prevent header injection. */
+	if (!grab_strieq(key, "User-Agent") &&
+	    !grab_strieq(key, "Accept") &&
+	    !grab_strieq(key, "Referer") &&
+	    !grab_strieq(key, "Origin") &&
+	    !grab_strieq(key, "Cookie"))
+		return;
+
 	snprintf(safe_value, sizeof(safe_value), "%s", value);
-	for (p = safe_value; *p; ++p) if (*p == '\r' || *p == '\n') *p = ' ';
+	for (p = safe_value; *p; ++p)
+		if (*p == '\r' || *p == '\n')
+			*p = ' ';
 	grab_trim_inplace(safe_value);
-	if (!safe_value[0]) return;
+	if (!safe_value[0])
+		return;
+
 	used = strlen(grab_ffmpeg_http_headers);
-	if (used + strlen(key) + strlen(safe_value) + 5 >= sizeof(grab_ffmpeg_http_headers)) return;
-	snprintf(grab_ffmpeg_http_headers + used, sizeof(grab_ffmpeg_http_headers) - used, "%s: %s\r\n", key, safe_value);
+	if (used + strlen(key) + strlen(safe_value) + 5 >= sizeof(grab_ffmpeg_http_headers))
+		return;
+	snprintf(grab_ffmpeg_http_headers + used,
+	         sizeof(grab_ffmpeg_http_headers) - used,
+	         "%s: %s\r\n", key, safe_value);
 }
 
 static void grab_parse_iptv_url_options_inplace(char *url)
 {
-	char *opts, *p;
-	if (!url) return;
+	char *opts;
+	char *p;
+	if (!url)
+		return;
+
 	opts = strchr(url, '#');
-	if (!opts) return;
+	if (!opts)
+		return;
 	*opts++ = 0;
 	grab_percent_decode_repeat_inplace(opts, 4);
+
 	p = opts;
 	while (p && *p)
 	{
 		char *next = strchr(p, '&');
 		char *eq;
-		char key[96], value[512];
-		if (next) *next++ = 0;
+		char key[96];
+		char value[512];
+		if (next)
+			*next++ = 0;
 		eq = strchr(p, '=');
 		if (eq)
 		{
@@ -474,7 +624,7 @@ static void grab_cut_encoded_url_field_inplace(char *url)
 		{
 			char *q = url + 1;
 			/* Be tolerant of references where only the scheme colon is encoded
-			 * but a URL port is left plain, e.g. http%3a//host:8080/path. */
+			 * but an URL port is left plain, e.g. http%3a//host:8080/path. */
 			if (isdigit((unsigned char)*q))
 			{
 				while (isdigit((unsigned char)*q))
@@ -572,37 +722,38 @@ static int grab_extract_embedded_stream_url(const char *sref, char *out, size_t 
 	return -1;
 }
 
-static int grab_is_iptv_reftype(const char *sref)
-{
-	/* E2 service-reference FIRST field is the service type.
-	 * IPTV variants: 4097 (extplayer), 5001/5002 (gstplayer/exteplayer3),
-	 * 8739 (streamlink).
-	 * Example: "4097:0:1:C2:C3:C3:14DD1:0:0:0:http%3a//..." */
-	if (!sref) return 0;
-	return !strncmp(sref, "4097:", 5) || !strncmp(sref, "5001:", 5) ||
-	       !strncmp(sref, "5002:", 5) || !strncmp(sref, "8739:", 5);
-}
-
 static int grab_normalize_stream_input(const char *in, char *out, size_t out_len)
 {
 	char tmp[4096];
 	char direct[4096];
-	if (!in || !*in || !out || out_len == 0) return -1;
-	grab_ffmpeg_reset_input_opts();
+	if (!in || !*in || !out || out_len == 0)
+		return -1;
 
-	/* Decide early: is the raw service reference an IPTV reftype?
-	 * Do this BEFORE any decoding/unescaping so we can prefer the local
-	 * Enigma2 relay for IPTV and avoid the provider's per-request token. */
+	grab_ffmpeg_reset_input_opts();
 	snprintf(tmp, sizeof(tmp), "%s", in);
 	grab_xml_unescape_inplace(tmp);
+
+	/* Direct URL/path input.  Decode repeatedly because OpenWebif XML may carry
+	 * service references where the path was encoded more than once. */
 	snprintf(direct, sizeof(direct), "%s", tmp);
 	grab_percent_decode_repeat_inplace(direct, 4);
-
 	if (!strncmp(direct, "http://", 7) || !strncmp(direct, "https://", 8))
-	{ grab_parse_iptv_url_options_inplace(direct); snprintf(out, out_len, "%s", direct); return 0; }
+	{
+		grab_parse_iptv_url_options_inplace(direct);
+		snprintf(out, out_len, "%s", direct);
+		return 0;
+	}
 	if (!strncmp(direct, "file:", 5) || direct[0] == '/')
-	{ snprintf(out, out_len, "%s", direct); return 0; }
-	if (grab_extract_embedded_stream_url(tmp, out, out_len) == 0) return 0;
+	{
+		snprintf(out, out_len, "%s", direct);
+		return 0;
+	}
+
+	/* IPTV service references may contain the real http(s) URL as one field. */
+	if (grab_extract_embedded_stream_url(tmp, out, out_len) == 0)
+		return 0;
+
+	/* Treat everything else as an Enigma2 DVB/service reference. */
 	grab_percent_decode_inplace(tmp);
 	snprintf(out, out_len, "http://127.0.0.1:8001/%s", tmp);
 	return 0;
@@ -612,19 +763,15 @@ static int grab_get_current_stream_input(char *out, size_t out_len, const char *
 {
 	char body[8192];
 	char sref[2048];
-	char input_file[2048];
-	if (override && *override) return grab_normalize_stream_input(override, out, out_len);
+
+	if (override && *override)
+		return grab_normalize_stream_input(override, out, out_len);
+
+	/* OpenWebif/WebInterface normally provides the currently playing service here. */
 	if (grab_http_get_local80("/web/getcurrent", body, sizeof(body)) == 0 &&
 	    grab_extract_xml_tag(body, "e2servicereference", sref, sizeof(sref)) == 0)
-	{
-		if (grab_normalize_stream_input(sref, out, out_len) == 0) return 0;
-	}
-	if (grab_read_text_file("/proc/stb/vmpeg/0/input", input_file, sizeof(input_file)) == 0)
-	{
-		if (grab_normalize_stream_input(input_file, out, out_len) == 0) return 0;
-		if (strncmp(input_file, "1:", 2) == 0)
-		{ grab_percent_decode_inplace(input_file); snprintf(out, out_len, "http://127.0.0.1:8001/%s", input_file); return 0; }
-	}
+		return grab_normalize_stream_input(sref, out, out_len);
+
 	return -1;
 }
 
@@ -632,38 +779,55 @@ static int grab_run_argv(char *const argv[])
 {
 	pid_t pid;
 	int status = 0;
+
 	if (!quiet)
 	{
 		int i;
 		fprintf(stderr, "ffmpeg backend:");
 		for (i = 0; argv[i]; ++i)
 		{
-			if (i > 0 && !strcmp(argv[i - 1], "-headers")) fprintf(stderr, " <headers>");
-			else if (!strncmp(argv[i], "http://", 7) || !strncmp(argv[i], "https://", 8)) fprintf(stderr, " <stream-url>");
-			else fprintf(stderr, " %s", argv[i]);
+			if (i > 0 && !strcmp(argv[i - 1], "-headers"))
+				fprintf(stderr, " <headers>");
+			else if (!strncmp(argv[i], "http://", 7) || !strncmp(argv[i], "https://", 8))
+				fprintf(stderr, " <stream-url>");
+			else
+				fprintf(stderr, " %s", argv[i]);
 		}
 		fprintf(stderr, "\n");
 	}
+
 	pid = fork();
-	if (pid < 0) return -1;
-	if (pid == 0) { execvp(argv[0], argv); _exit(127); }
-	if (waitpid(pid, &status, 0) < 0) return -1;
-	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return -1;
+	if (pid < 0)
+		return -1;
+	if (pid == 0)
+	{
+		execvp(argv[0], argv);
+		_exit(127);
+	}
+	if (waitpid(pid, &status, 0) < 0)
+		return -1;
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		return -1;
 	return 0;
 }
 
 static const char *grab_ffmpeg_codec_name(int use_png, int use_jpg)
 {
-	if (use_png) return "png";
-	if (use_jpg) return "mjpeg";
-	return NULL;
+	if (use_png)
+		return "png";
+	if (use_jpg)
+		return "mjpeg";
+	return NULL; /* BMP is written by grab itself from raw BGR24. */
 }
 
 static int grab_ffmpeg_quality_arg(int jpg_quality)
 {
 	int q;
-	if (jpg_quality <= 0) jpg_quality = 80;
-	if (jpg_quality > 100) jpg_quality = 100;
+	if (jpg_quality <= 0)
+		jpg_quality = 80;
+	if (jpg_quality > 100)
+		jpg_quality = 100;
+	/* ffmpeg mjpeg qscale: 2 is high quality, 31 is worst. */
 	q = 31 - (jpg_quality * 29 / 100);
 	if (q < 2) q = 2;
 	if (q > 31) q = 31;
@@ -682,9 +846,16 @@ static int grab_write_bmp24_bgr(const char *out, const unsigned char *bgr, int w
 	const int pad_bytes = padded_row - row_bytes;
 	const uint32_t image_size = (uint32_t)padded_row * (uint32_t)h;
 	const uint32_t file_size = image_size + 14U + 40U;
-	if (!out || !bgr || w <= 0 || h <= 0 || w > 3840 || h > 2160) return -1;
+
+	if (!out || !bgr || w <= 0 || h <= 0 || w > 3840 || h > 2160)
+		return -1;
+
 	fp = fopen(out, "wb");
-	if (!fp) { fprintf(stderr, "ffmpeg backend: failed to open BMP output %s: %s\n", out, strerror(errno)); return -1; }
+	if (!fp) {
+		fprintf(stderr, "ffmpeg backend: failed to open BMP output %s: %s\n", out, strerror(errno));
+		return -1;
+	}
+
 #define PUT32_LE(x) do { uint32_t v__ = (uint32_t)(x); hdr[i++] = v__ & 0xff; hdr[i++] = (v__ >> 8) & 0xff; hdr[i++] = (v__ >> 16) & 0xff; hdr[i++] = (v__ >> 24) & 0xff; } while (0)
 #define PUT16_LE(x) do { uint16_t v__ = (uint16_t)(x); hdr[i++] = v__ & 0xff; hdr[i++] = (v__ >> 8) & 0xff; } while (0)
 #define PUT8_LE(x)  do { hdr[i++] = (unsigned char)(x); } while (0)
@@ -697,13 +868,27 @@ static int grab_write_bmp24_bgr(const char *out, const unsigned char *bgr, int w
 #undef PUT32_LE
 #undef PUT16_LE
 #undef PUT8_LE
-	if (fwrite(hdr, 1, sizeof(hdr), fp) != sizeof(hdr)) { fclose(fp); return -1; }
+
+	if (fwrite(hdr, 1, sizeof(hdr), fp) != sizeof(hdr)) {
+		fclose(fp);
+		return -1;
+	}
+
+	/* BMP stores bottom-up rows.  ffmpeg rawvideo gives top-down BGR24. */
 	for (y = h - 1; y >= 0; --y) {
 		const unsigned char *row = bgr + (size_t)y * (size_t)row_bytes;
-		if (fwrite(row, 1, (size_t)row_bytes, fp) != (size_t)row_bytes) { fclose(fp); return -1; }
-		if (pad_bytes && fwrite(pad, 1, (size_t)pad_bytes, fp) != (size_t)pad_bytes) { fclose(fp); return -1; }
+		if (fwrite(row, 1, (size_t)row_bytes, fp) != (size_t)row_bytes) {
+			fclose(fp);
+			return -1;
+		}
+		if (pad_bytes && fwrite(pad, 1, (size_t)pad_bytes, fp) != (size_t)pad_bytes) {
+			fclose(fp);
+			return -1;
+		}
 	}
-	if (fclose(fp) != 0) return -1;
+
+	if (fclose(fp) != 0)
+		return -1;
 	return 0;
 }
 
@@ -711,9 +896,12 @@ static int grab_read_exact_file(const char *path, unsigned char *buf, size_t len
 {
 	FILE *fp;
 	size_t got;
-	if (!path || !buf || len == 0) return -1;
+
+	if (!path || !buf || len == 0)
+		return -1;
 	fp = fopen(path, "rb");
-	if (!fp) return -1;
+	if (!fp)
+		return -1;
 	got = fread(buf, 1, len, fp);
 	fclose(fp);
 	return got == len ? 0 : -1;
@@ -724,28 +912,56 @@ static int grab_raw_bgr24_file_to_bmp(const char *raw_path, const char *bmp_path
 	const size_t need = (size_t)w * (size_t)h * 3U;
 	unsigned char *buf;
 	int ret;
-	if (w <= 0 || h <= 0 || need == 0 || need > 64U * 1024U * 1024U) return -1;
+
+	if (w <= 0 || h <= 0 || need == 0 || need > 64U * 1024U * 1024U)
+		return -1;
+
 	buf = (unsigned char *)malloc(need);
-	if (!buf) { fprintf(stderr, "ffmpeg backend: malloc failed for raw frame size=%zu\n", need); return -1; }
+	if (!buf) {
+		fprintf(stderr, "ffmpeg backend: malloc failed for raw frame size=%zu\n", need);
+		return -1;
+	}
+
 	ret = grab_read_exact_file(raw_path, buf, need);
-	if (ret < 0) fprintf(stderr, "ffmpeg backend: raw BGR frame is missing or short: %s expected=%zu\n", raw_path, need);
-	else ret = grab_write_bmp24_bgr(bmp_path, buf, w, h);
+	if (ret < 0)
+		fprintf(stderr, "ffmpeg backend: raw BGR frame is missing or short: %s expected=%zu\n", raw_path, need);
+	else
+		ret = grab_write_bmp24_bgr(bmp_path, buf, w, h);
+
 	free(buf);
 	return ret;
 }
 
 static int grab_read_current_video_size(int *w, int *h)
 {
-	int rw = 0, rh = 0, sw = 0, sh = 0;
+	int rw = 0, rh = 0;
+	int sw = 0, sh = 0;
+
+	/*
+	 * Old Broadcom/Dreambox drivers normally expose the active video size as
+	 * hexadecimal values below /proc/stb/vmpeg.  DreamOne/DreamTwo (DMNEW)
+	 * can instead have the useful decoder size in /sys/class/video/frame_*;
+	 * if we only look at /proc/stb/vmpeg there, UHD may be missed and grab
+	 * falls back to the old /dev/videograbber path, producing the broken
+	 * green/noisy image.
+	 */
 	readIntFromFile("/proc/stb/vmpeg/0/xres", 16, &rw);
 	readIntFromFile("/proc/stb/vmpeg/0/yres", 16, &rh);
+
 	readIntFromFile("/sys/class/video/frame_width", 10, &sw);
 	readIntFromFile("/sys/class/video/frame_height", 10, &sh);
+
 	if (sw > 0 && sh > 0)
+	{
 		if (rw <= 0 || rh <= 0 ||
 		    ((unsigned long long)sw * (unsigned long long)sh >
 		     (unsigned long long)rw * (unsigned long long)rh))
-		{ rw = sw; rh = sh; }
+		{
+			rw = sw;
+			rh = sh;
+		}
+	}
+
 	if (w) *w = rw;
 	if (h) *h = rh;
 	return (rw > 0 && rh > 0) ? 0 : -1;
@@ -754,81 +970,74 @@ static int grab_read_current_video_size(int *w, int *h)
 static int grab_current_codec_is_hevc(void)
 {
 	char codec[128];
-	if (grab_read_text_file("/proc/stb/vmpeg/0/codec", codec, sizeof(codec)) < 0) return 0;
+	if (grab_read_text_file("/proc/stb/vmpeg/0/codec", codec, sizeof(codec)) < 0)
+		return 0;
 	return strcasestr(codec, "hevc") || strcasestr(codec, "h265") || strcasestr(codec, "h.265");
 }
 
 static int grab_current_service_type_is_hevc(void)
 {
-	char body[8192], sref[2048];
-	const char *p, *q;
+	char body[8192];
+	char sref[2048];
+	const char *p;
+	const char *q;
 	int idx = 0;
+
 	if (grab_http_get_local80("/web/getcurrent", body, sizeof(body)) < 0 ||
 	    grab_extract_xml_tag(body, "e2servicereference", sref, sizeof(sref)) < 0)
 		return 0;
+
 	for (p = sref; p && *p; p = q ? q + 1 : NULL, idx++)
 	{
 		q = strchr(p, ':');
-		if (idx == 2) return p[0] == '1' && (p[1] == 'F' || p[1] == 'f') && (p[2] == ':' || p[2] == 0);
-		if (!q) break;
+		/* Enigma2 service type 0x1F is HEVC/H.265 TV.  This catches
+		 * Dream HD services that are only 1920x1080 but still use HEVC and
+		 * therefore have the same broken raw grab/videograbber layout. */
+		if (idx == 2)
+		{
+			return p[0] == '1' && (p[1] == 'F' || p[1] == 'f') && (p[2] == ':' || p[2] == 0);
+		}
+		if (!q)
+			break;
 	}
+
 	return 0;
 }
 
 static int grab_current_video_is_hevc(void)
 {
-	if (grab_current_codec_is_hevc()) return 1;
-	if (grab_current_service_type_is_hevc()) return 1;
-	{
-		char in[2048];
-		if (grab_read_text_file("/proc/stb/vmpeg/0/input", in, sizeof(in)) == 0)
-			if (strcasestr(in, "hevc") || strcasestr(in, "h265") ||
-			    strcasestr(in, "h.265") || strcasestr(in, "1F:"))
-				return 1;
-	}
-	return 0;
+	return grab_current_codec_is_hevc() || grab_current_service_type_is_hevc();
 }
 
 static int grab_current_service_is_iptv(void)
 {
-	char body[8192], sref[2048], work[4096], input_file[2048];
-	if (grab_http_get_local80("/web/getcurrent", body, sizeof(body)) == 0 &&
-	    grab_extract_xml_tag(body, "e2servicereference", sref, sizeof(sref)) == 0)
-	{
-		snprintf(work, sizeof(work), "%s", sref);
-		grab_xml_unescape_inplace(work);
-		grab_percent_decode_repeat_inplace(work, 4);
-		if (grab_find_earliest_url_marker(work, NULL) != NULL) return 1;
-		{
-			const char *p = sref, *q;
-			int idx = 0;
-			for (; p && *p; p = q ? q + 1 : NULL, idx++)
-			{
-				q = strchr(p, ':');
-				if (idx == 2)
-				{
-					if (strncmp(p, "1000:", 5) == 0 || strncmp(p, "5001:", 5) == 0 ||
-					    strncmp(p, "5002:", 5) == 0 || strncmp(p, "4097:", 5) == 0)
-						return 1;
-					break;
-				}
-				if (!q) break;
-			}
-		}
+	char body[8192];
+	char sref[2048];
+	char work[4096];
+
+	if (grab_http_get_local80("/web/getcurrent", body, sizeof(body)) < 0 ||
+	    grab_extract_xml_tag(body, "e2servicereference", sref, sizeof(sref)) < 0)
 		return 0;
-	}
-	if (grab_read_text_file("/proc/stb/vmpeg/0/input", input_file, sizeof(input_file)) == 0)
-	{
-		snprintf(work, sizeof(work), "%s", input_file);
-		grab_xml_unescape_inplace(work);
-		grab_percent_decode_repeat_inplace(work, 4);
-		if (grab_find_earliest_url_marker(work, NULL) != NULL) return 1;
-	}
-	return 0;
+
+	/* IPTV service references usually embed the real stream URL as one field.
+	 * It may be percent-encoded more than once, e.g. http%253a//... .
+	 * Detect that without normalizing the global ffmpeg input options here;
+	 * the real extraction and header parsing still happens later in
+	 * grab_get_current_stream_input(). */
+	snprintf(work, sizeof(work), "%s", sref);
+	grab_xml_unescape_inplace(work);
+	grab_percent_decode_repeat_inplace(work, 4);
+
+	return grab_find_earliest_url_marker(work, NULL) != NULL;
 }
 
 static int grab_current_video_is_dmnew_sd576(int w, int h)
 {
+	/* DreamOne/DreamTwo still have a second native-grabber corner case on
+	 * some 720x576 SD services.  Keep this scoped to DMNEW only: DM900/DM920
+	 * Broadcom SD grabs are not part of this workaround.  Accept a slightly
+	 * widened width range so both 4:3 and anamorphic/driver-normalized PAL SD
+	 * reports are caught, while normal HD remains on the fast native path. */
 	return stb_type == DMNEW && h == 576 && w >= 352 && w <= 1024;
 }
 
@@ -837,35 +1046,260 @@ static int grab_ffmpeg_backend_should_autouse(int *src_w, int *src_h)
 	int w = 0, h = 0;
 	int hevc;
 	int dmnew_sd576;
-
 	grab_read_current_video_size(&w, &h);
-	hevc        = grab_current_video_is_hevc();
+	hevc = grab_current_video_is_hevc();
 	dmnew_sd576 = grab_current_video_is_dmnew_sd576(w, h);
-
 	if (src_w) *src_w = w;
 	if (src_h) *src_h = h;
 
-	/*
-	 * Native grabber for SD/HD/FHD H.264 (DVB and IPTV).
-	 * ffmpeg only for HEVC/H.265 or >1920x1080 (DVB and IPTV),
-	 * plus the DreamOne/Two SD576 corner case.
-	 *
-	 * DM900 (BRCM7439) and DM920 (BRCM7252S) share the same decoder
-	 * memory layout, so SD/HD/FHD H.264 IPTV stays native on both.
-	 * Opening a second ffmpeg stream connection just because the
-	 * service reference contains a URL is the bug fixed in d738134.
-	 */
-	if ((stb_type == BRCM7439 || stb_type == BRCM7252S || stb_type == DMNEW) &&
-	    (w > 1920 || h > 1080 || hevc || dmnew_sd576))
+	/* DreamOne/DreamTwo only: ffmpeg is the fallback for UHD, HEVC/H.265 and
+	 * PAL SD 720x576-like services when amlvideo2 cannot deliver the picture,
+	 * because the raw /dev/videograbber path can return corrupted frames.
+	 * DM900/DM920 always read the decoder memory directly: getvideo() handles
+	 * UHD and 10-bit pictures there, so no second stream connection is needed. */
+	if (stb_type == DMNEW && (w > 1920 || h > 1080 || hevc || dmnew_sd576))
 		return 1;
 
 	return 0;
 }
 
+
+/*
+ * DreamOne/DreamTwo: read the picture back through vdin1 and the amlvideo2
+ * V4L2 device.  This works for every codec, AFBC compressed HEVC included.
+ * The post blend port returns the screen as shown, video and OSD composed by
+ * the hardware.  The VD1 port returns the video layer alone; it lands at the
+ * top left corner of the frame in the size of the video window, so only that
+ * part is copied and the caller places it at the axis position.
+ */
+#define AMLV2_NAME			"amlvideo2"
+#define AMLV2_PORT_VIU1_WB0_VD1		0xa002
+#define AMLV2_PORT_VIU1_WB0_POST_BLEND	0xa007
+#define AMLV2_START_VDIN1		((1U << 28) | (1U << 24))
+#define AMLV2_MAX_WIDTH		3840
+#define AMLV2_BUFFERS		2
+/* above this width a single buffer fits the driver's capture memory */
+#define AMLV2_HD_WIDTH		1920
+
+static char amlvideo2_dev[32];
+
+static int amlvideo2_usable(void)
+{
+	char path[64], name[32];
+	int i;
+
+	if (stb_type != DMNEW)
+		return 0;
+	for (i = 0; i < 64; i++)
+	{
+		snprintf(path, sizeof(path), "/sys/class/video4linux/video%d/name", i);
+		if (grab_read_text_file(path, name, sizeof(name)) == 0 && strcmp(name, AMLV2_NAME) == 0)
+		{
+			snprintf(amlvideo2_dev, sizeof(amlvideo2_dev), "/dev/video%d", i);
+			return access(amlvideo2_dev, R_OK | W_OK) == 0;
+		}
+	}
+	return 0;
+}
+
+/* A driver limited to HD writes an upscaled VD1 layer back only in its source
+ * size; the one with 4K capture sizes also scales the VD1 window correctly. */
+static int amlvideo2_vd1_usable(void)
+{
+	int src_w = 0, src_h = 0, win_l, win_t, win_w = 0, win_h = 0;
+	struct v4l2_format fmt;
+	int fd, uhd = 0;
+
+	fd = open(amlvideo2_dev, O_RDWR);
+	if (fd >= 0)
+	{
+		memset(&fmt, 0, sizeof(fmt));
+		fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		fmt.fmt.pix.width = 3840;
+		fmt.fmt.pix.height = 2160;
+		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_BGR24;
+		fmt.fmt.pix.field = V4L2_FIELD_ANY;
+		uhd = ioctl(fd, VIDIOC_TRY_FMT, &fmt) == 0 && fmt.fmt.pix.width >= 3840;
+		close(fd);
+	}
+	return uhd || (aml_pick_axis(&win_l, &win_t, &win_w, &win_h) &&
+	       readIntFromFile("/sys/class/video/frame_width", 10, &src_w) == 0 &&
+	       readIntFromFile("/sys/class/video/frame_height", 10, &src_h) == 0 &&
+	       src_w >= win_w && src_h >= win_h);
+}
+
+static int amlvideo2_dqbuf(int fd, struct v4l2_buffer *b)
+{
+	struct pollfd pfd = { .fd = fd, .events = POLLIN };
+
+	if (poll(&pfd, 1, 2000) <= 0)
+		return -1;
+	memset(b, 0, sizeof(*b));
+	b->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	b->memory = V4L2_MEMORY_MMAP;
+	return ioctl(fd, VIDIOC_DQBUF, b);
+}
+
+static int getvideo_amlvideo2(unsigned char *video, int *xres, int *yres, unsigned int port)
+{
+	char buf[32];
+	int disp_w = 0, disp_h = 0, cap_w, cap_h, fmt_w0, fmt_h0, win_l, win_t, win_w, win_h, w, h, y;
+	int fd, ret = -1, streaming = 0;
+	unsigned int i, count = 0;
+	void *map[AMLV2_BUFFERS] = { NULL };
+	size_t map_len[AMLV2_BUFFERS] = { 0 };
+	unsigned int input = AMLV2_START_VDIN1 | port;
+	int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	struct v4l2_format fmt;
+	struct v4l2_requestbuffers req;
+	struct v4l2_buffer b;
+	unsigned char *row = NULL;
+	size_t row_len;
+
+	if (grab_read_text_file("/sys/class/video/device_resolution", buf, sizeof(buf)) < 0 ||
+	    sscanf(buf, "%dx%d", &disp_w, &disp_h) != 2 || disp_w <= 0 || disp_h <= 0)
+		return -1;
+	cap_w = disp_w;
+	cap_h = disp_h;
+	if (cap_w > AMLV2_MAX_WIDTH)
+	{
+		cap_h = (int)((long long)cap_h * AMLV2_MAX_WIDTH / cap_w) & ~1;
+		cap_w = AMLV2_MAX_WIDTH;
+	}
+	if (port != AMLV2_PORT_VIU1_WB0_VD1 || !aml_pick_axis(&win_l, &win_t, &win_w, &win_h))
+	{
+		win_w = disp_w;
+		win_h = disp_h;
+	}
+	if (win_w > disp_w)
+		win_w = disp_w;
+	if (win_h > disp_h)
+		win_h = disp_h;
+	w = (int)((long long)win_w * cap_w / disp_w);
+	h = (int)((long long)win_h * cap_h / disp_h);
+	/* a scaled down layer leaves two undefined pixels at its right and bottom edge */
+	if (win_w < disp_w || win_h < disp_h)
+	{
+		w -= 2;
+		h -= 2;
+	}
+	w &= ~1;
+	h &= ~1;
+	if (w <= 0 || h <= 0)
+		return -1;
+
+	fmt_w0 = cap_w;
+	fmt_h0 = cap_h;
+	fd = open(amlvideo2_dev, O_RDWR);
+	if (fd < 0)
+		return -1;
+	memset(&fmt, 0, sizeof(fmt));
+	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	fmt.fmt.pix.width = cap_w;
+	fmt.fmt.pix.height = cap_h;
+	fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_BGR24;
+	fmt.fmt.pix.field = V4L2_FIELD_ANY;
+	memset(&req, 0, sizeof(req));
+	req.count = AMLV2_BUFFERS;
+	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	req.memory = V4L2_MEMORY_MMAP;
+	if (ioctl(fd, VIDIOC_S_INPUT, &input) < 0 ||
+	    ioctl(fd, VIDIOC_S_FMT, &fmt) < 0)
+		goto out;
+	/* a driver without 4K support clamps the size, scale down to its limit */
+	if ((int)fmt.fmt.pix.width < cap_w || (int)fmt.fmt.pix.height < cap_h)
+	{
+		int max_w = fmt.fmt.pix.width, max_h = fmt.fmt.pix.height;
+
+		if (max_w <= 0 || max_h <= 0)
+			goto out;
+		if ((long long)cap_w * max_h > (long long)cap_h * max_w)
+		{
+			cap_h = (int)((long long)cap_h * max_w / cap_w) & ~1;
+			cap_w = max_w;
+		}
+		else
+		{
+			cap_w = (int)((long long)cap_w * max_h / cap_h) & ~1;
+			cap_h = max_h;
+		}
+		w = (int)((long long)w * cap_w / fmt_w0) & ~1;
+		h = (int)((long long)h * cap_h / fmt_h0) & ~1;
+		fmt.fmt.pix.width = cap_w;
+		fmt.fmt.pix.height = cap_h;
+		if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0 ||
+		    (int)fmt.fmt.pix.width < cap_w || (int)fmt.fmt.pix.height < cap_h)
+			goto out;
+	}
+	req.count = cap_w > AMLV2_HD_WIDTH ? 1 : AMLV2_BUFFERS;
+	if (ioctl(fd, VIDIOC_REQBUFS, &req) < 0 || req.count == 0)
+		goto out;
+	count = req.count < AMLV2_BUFFERS ? req.count : AMLV2_BUFFERS;
+	for (i = 0; i < count; i++)
+	{
+		memset(&b, 0, sizeof(b));
+		b.index = i;
+		b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		b.memory = V4L2_MEMORY_MMAP;
+		if (ioctl(fd, VIDIOC_QUERYBUF, &b) < 0)
+			goto out;
+		/* videobuf only maps shared writable mappings */
+		map[i] = mmap(NULL, b.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, b.m.offset);
+		if (map[i] == MAP_FAILED)
+		{
+			map[i] = NULL;
+			goto out;
+		}
+		map_len[i] = b.length;
+		if (ioctl(fd, VIDIOC_QBUF, &b) < 0)
+			goto out;
+	}
+	if (ioctl(fd, VIDIOC_STREAMON, &type) < 0)
+		goto out;
+	streaming = 1;
+	/* the first frame can still hold an older picture */
+	if (amlvideo2_dqbuf(fd, &b) < 0 || ioctl(fd, VIDIOC_QBUF, &b) < 0 ||
+	    amlvideo2_dqbuf(fd, &b) < 0 || b.index >= count)
+		goto out;
+	/* the buffer is mapped uncached and faults on unaligned loads, so each
+	 * row goes through an aligned bounce buffer */
+	row_len = ((size_t)w * 3 + 63) & ~(size_t)63;
+	if (row_len > fmt.fmt.pix.bytesperline)
+		row_len = fmt.fmt.pix.bytesperline;
+	if (posix_memalign((void **)&row, 64, row_len) != 0)
+	{
+		row = NULL;
+		goto out;
+	}
+	for (y = 0; y < h; y++)
+	{
+		memcpy(row, (unsigned char *)map[b.index] + (size_t)y * fmt.fmt.pix.bytesperline, row_len);
+		memcpy(video + (size_t)y * w * 3, row, (size_t)w * 3);
+	}
+	*xres = w;
+	*yres = h;
+	ret = 0;
+out:
+	if (ret < 0)
+		fprintf(stderr, "amlvideo2: capture failed (%m)\n");
+	/* stop vdin1 on every path, an open stream keeps it running */
+	if (streaming)
+		ioctl(fd, VIDIOC_STREAMOFF, &type);
+	for (i = 0; i < AMLV2_BUFFERS; i++)
+		if (map[i])
+			munmap(map[i], map_len[i]);
+	free(row);
+	close(fd);
+	return ret;
+}
+
 static const char *grab_ffmpeg_loglevel(void)
 {
 	const char *env = getenv("GRAB_FFMPEG_LOGLEVEL");
-	if (env && *env) return env;
+	if (env && *env)
+		return env;
+	/* Live HEVC joins often print PPS/RPS errors until the next decodable
+	 * access point.  They are expected and would only slow/log-spam WebIF. */
 	return "fatal";
 }
 
@@ -875,11 +1309,10 @@ static const char *grab_ffmpeg_loglevel(void)
 
 static void grab_make_ffmpeg_scale_fast(char *dst, size_t dst_len, int out_w, int out_h, int frame_mode)
 {
-	(void)frame_mode;
-	/* No fps filter. For a single still we want the very next frame,
-	 * not a half-second tick. `fps=1/2` alone used to cost 4-8s on UHD
-	 * IPTV because of long GOPs. */
-	snprintf(dst, dst_len, "scale=%d:%d:flags=fast_bilinear,format=bgr24", out_w, out_h);
+	if (frame_mode == GRAB_FFMPEG_FRAME_WAIT)
+		snprintf(dst, dst_len, "fps=1/2,scale=%d:%d:flags=fast_bilinear,format=bgr24", out_w, out_h);
+	else
+		snprintf(dst, dst_len, "scale=%d:%d:flags=fast_bilinear,format=bgr24", out_w, out_h);
 }
 
 static int grab_run_argv_capture_stdout(char *const argv[], unsigned char *buf, size_t need)
@@ -888,22 +1321,37 @@ static int grab_run_argv_capture_stdout(char *const argv[], unsigned char *buf, 
 	pid_t pid;
 	int status = 0;
 	size_t got = 0;
-	if (!argv || !buf || need == 0) return -1;
+
+	if (!argv || !buf || need == 0)
+		return -1;
+
 	if (!quiet)
 	{
 		int i;
 		fprintf(stderr, "ffmpeg backend:");
 		for (i = 0; argv[i]; ++i)
 		{
-			if (i > 0 && !strcmp(argv[i - 1], "-headers")) fprintf(stderr, " <headers>");
-			else if (!strncmp(argv[i], "http://", 7) || !strncmp(argv[i], "https://", 8)) fprintf(stderr, " <stream-url>");
-			else fprintf(stderr, " %s", argv[i]);
+			if (i > 0 && !strcmp(argv[i - 1], "-headers"))
+				fprintf(stderr, " <headers>");
+			else if (!strncmp(argv[i], "http://", 7) || !strncmp(argv[i], "https://", 8))
+				fprintf(stderr, " <stream-url>");
+			else
+				fprintf(stderr, " %s", argv[i]);
 		}
 		fprintf(stderr, "\n");
 	}
-	if (pipe(pipefd) < 0) return -1;
+
+	if (pipe(pipefd) < 0)
+		return -1;
+
 	pid = fork();
-	if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return -1; }
+	if (pid < 0)
+	{
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return -1;
+	}
+
 	if (pid == 0)
 	{
 		close(pipefd[0]);
@@ -912,21 +1360,33 @@ static int grab_run_argv_capture_stdout(char *const argv[], unsigned char *buf, 
 		execvp(argv[0], argv);
 		_exit(127);
 	}
+
 	close(pipefd[1]);
 	while (got < need)
 	{
 		ssize_t r = read(pipefd[0], buf + got, need - got);
-		if (r < 0) { if (errno == EINTR) continue; break; }
-		if (r == 0) break;
+		if (r < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (r == 0)
+			break;
 		got += (size_t)r;
 	}
 	close(pipefd[0]);
-	if (waitpid(pid, &status, 0) < 0) return -1;
+
+	if (waitpid(pid, &status, 0) < 0)
+		return -1;
+
 	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || got != need)
 	{
-		if (!quiet) fprintf(stderr, "ffmpeg backend: raw stdout frame incomplete got=%zu expected=%zu\n", got, need);
+		if (!quiet)
+			fprintf(stderr, "ffmpeg backend: raw stdout frame incomplete got=%zu expected=%zu\n", got, need);
 		return -1;
 	}
+
 	return 0;
 }
 
@@ -935,69 +1395,58 @@ static int grab_ffmpeg_decode_bgr24_to_buffer(const char *input, unsigned char *
 	char vf[128];
 	const char *loglevel = grab_ffmpeg_loglevel();
 	size_t need;
-	char *argv[40];
+	char *argv[36];
 	int n = 0;
-	int add_nokey = 0;
-	if (!input || !video || out_w <= 0 || out_h <= 0 || out_w > 1920 || out_h > 1080) return -1;
+
+	if (!input || !video || out_w <= 0 || out_h <= 0 || out_w > 1920 || out_h > 1080)
+		return -1;
+
 	need = (size_t)out_w * (size_t)out_h * 3U;
-	if (need == 0 || need > 1920U * 1080U * 3U) return -1;
+	if (need == 0 || need > 1920U * 1080U * 3U)
+		return -1;
+
 	grab_make_ffmpeg_scale_fast(vf, sizeof(vf), out_w, out_h, frame_mode);
-	/* -skip_frame nokey is NOT used for HEVC grabs.
-	 * Vavoo/HLS providers serve segments where the keyframe is not at
-	 * the segment boundary; ffmpeg would have to burn through multiple
-	 * .ts segments (~6-10s) waiting for the first IDR.  Decoding the
-	 * first available P-frame gives us a usable picture in <1s.  The
-	 * only downside is a possibly-slightly-torn first frame, which is
-	 * acceptable for a still-grab.  Do NOT re-enable this. */
-	(void)frame_mode;
-	add_nokey = 0;
+
 	argv[n++] = "/usr/bin/ffmpeg";
 	argv[n++] = "-hide_banner";
 	argv[n++] = "-nostdin";
 	argv[n++] = "-loglevel";
 	argv[n++] = (char *)loglevel;
-	if (grab_ffmpeg_http_headers[0]) { argv[n++] = "-headers"; argv[n++] = grab_ffmpeg_http_headers; }
-	/* Still-grab tuning.
-	 * - Vavoo (4323): keep the previously-tuned 1M/1s values.
-	 * - YouTube / generic HLS IPTV: needs a much larger probe and
-	 *   analysis window or ffmpeg will return a black first frame.
-	 * - DVB-S/C/T: local TS, 1M/1s is plenty. */
-	int is_iptv = grab_current_service_is_iptv();
-	if (is_iptv && strstr(input, "4323")) {
-		argv[n++] = "-probesize";       argv[n++] = "1048576";
-		argv[n++] = "-analyzeduration"; argv[n++] = "1000000";
-	} else if (is_iptv) {
-		/* Reduced from 5M/10s to 1M/1s to speed up 4K IPTV grabs.
-		 * If you get black screens again on specific providers, 
-		 * bump analyzeduration to 3000000 (3s) or 5000000 (5s). */
-		argv[n++] = "-probesize";       argv[n++] = "1048576";
-		argv[n++] = "-analyzeduration"; argv[n++] = "1000000";
-	} else {
-		argv[n++] = "-probesize";       argv[n++] = "1048576";
-		argv[n++] = "-analyzeduration"; argv[n++] = "1000000";
+	if (grab_ffmpeg_http_headers[0])
+	{
+		argv[n++] = "-headers";
+		argv[n++] = grab_ffmpeg_http_headers;
 	}
-	argv[n++] = "-fflags";          argv[n++] = "nobuffer";
-	/* -flags low_delay removed: DM920's ffmpeg emits a black first
-	 * frame for HEVC when it's set. */
-	/* Give slow providers (YouTube/HLS, Stalker/bossco) enough time to
-	 * send the first frame without triggering a full grab retry, and
-	 * use more threads for 4K HEVC decoding.
-	 * -rw_timeout is a *maximum* wait: fast streams still return in
-	 * well under a second, so this cannot slow down healthy DVB/Vavoo. */
-	argv[n++] = "-rw_timeout";      argv[n++] = "20000000";
-	argv[n++] = "-t";               argv[n++] = "15";
-	argv[n++] = "-threads";         argv[n++] = "4";
-	argv[n++] = "-filter_threads";  argv[n++] = "4";
-	argv[n++] = "-an"; argv[n++] = "-sn"; argv[n++] = "-dn";
-	if (add_nokey) { argv[n++] = "-skip_frame"; argv[n++] = "nokey"; }
-	argv[n++] = "-i"; argv[n++] = (char *)input;
-	argv[n++] = "-map"; argv[n++] = "0:v:0";
-	argv[n++] = "-vf"; argv[n++] = vf;
-	argv[n++] = "-vframes"; argv[n++] = "1";
-	argv[n++] = "-f"; argv[n++] = "rawvideo";
-	argv[n++] = "-pix_fmt"; argv[n++] = "bgr24";
+	argv[n++] = "-an";
+	argv[n++] = "-sn";
+	argv[n++] = "-dn";
+	if (frame_mode == GRAB_FFMPEG_FRAME_KEYONLY)
+	{
+		/*
+		 * Some Dream HEVC services, especially 8-bit DVB HD services, start the
+		 * live/recorded TS join on P frames before ffmpeg has usable reference
+		 * pictures.  ffmpeg may still output a complete but grey/black corrupted
+		 * frame, so the normal fast path appears successful.  Decode only the next
+		 * key frame for HEVC to get the first independently decodable image.
+		 */
+		argv[n++] = "-skip_frame";
+		argv[n++] = "nokey";
+	}
+	argv[n++] = "-i";
+	argv[n++] = (char *)input;
+	argv[n++] = "-map";
+	argv[n++] = "0:v:0";
+	argv[n++] = "-vf";
+	argv[n++] = vf;
+	argv[n++] = "-vframes";
+	argv[n++] = "1";
+	argv[n++] = "-f";
+	argv[n++] = "rawvideo";
+	argv[n++] = "-pix_fmt";
+	argv[n++] = "bgr24";
 	argv[n++] = "pipe:1";
 	argv[n++] = NULL;
+
 	return grab_run_argv_capture_stdout(argv, video, need);
 }
 
@@ -1007,43 +1456,3886 @@ static int grab_ffmpeg_getvideo_frame(unsigned char *video, int *xres, int *yres
 	int src_w = 0, src_h = 0;
 	int out_w, out_h;
 	int ret;
+
 	if (xres) *xres = 0;
 	if (yres) *yres = 0;
+
 	if (access("/usr/bin/ffmpeg", X_OK) != 0)
-	{ fprintf(stderr, "ffmpeg backend: /usr/bin/ffmpeg is not executable\n"); return -1; }
+	{
+		fprintf(stderr, "ffmpeg backend: /usr/bin/ffmpeg is not executable\n");
+		return -1;
+	}
+
 	if (grab_get_current_stream_input(input, sizeof(input), input_override) < 0)
-	{ fprintf(stderr, "ffmpeg backend: could not determine current service input\n"); return -1; }
+	{
+		fprintf(stderr, "ffmpeg backend: could not determine current service input from local WebInterface/OpenWebif\n");
+		return -1;
+	}
+
 	grab_read_current_video_size(&src_w, &src_h);
 	out_w = width > 0 ? width : (src_w > 1920 ? 1920 : (src_w > 0 ? src_w : 1920));
-	if (out_w > 1920) out_w = 1920;
-	if (out_w <= 0) out_w = 1920;
+	if (out_w > 1920)
+		out_w = 1920;
+	if (out_w <= 0)
+		out_w = 1920;
+
 	out_h = (src_w > 0 && src_h > 0) ? (int)((long long)src_h * out_w / src_w) : (out_w * 9 / 16);
-	if (out_h <= 0) out_h = out_w * 9 / 16;
-	if (out_h > 1080) out_h = 1080;
-	if (out_h & 1) out_h++;
+	if (out_h <= 0)
+		out_h = out_w * 9 / 16;
+	if (out_h > 1080)
+		out_h = 1080;
+	if (out_h & 1)
+		out_h++;
+
 	if (!quiet)
-		fprintf(stderr, "ffmpeg backend: input=<stream-url> output=%dx%d target=internal-bgr24%s\n",
-		        out_w, out_h, grab_ffmpeg_http_headers[0] ? " headers=yes" : "");
-	if (grab_current_video_is_hevc())
+		fprintf(stderr, "ffmpeg backend: input=<stream-url> output=%dx%d target=internal-bgr24%s\n", out_w, out_h, grab_ffmpeg_http_headers[0] ? " headers=yes" : "");
+
+	if (grab_current_video_is_hevc() && !grab_current_service_is_iptv())
 	{
-		if (!quiet) fprintf(stderr, "ffmpeg backend: HEVC stream, key-frame path\n");
+		/*
+		 * DVB HEVC can output a syntactically complete but visually corrupted
+		 * first frame when the grab starts before the next random access point.
+		 * VLC hides this by waiting for a usable reference/key frame.  Do the same
+		 * for Dream HEVC DVB captures.  IPTV stays on the faster path because the
+		 * direct URL probe already produced correct frames there.
+		 */
+		if (!quiet)
+			fprintf(stderr, "ffmpeg backend: HEVC DVB stream, waiting for next key frame\n");
 		ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_KEYONLY);
-		if (ret < 0) {
-			if (!quiet) fprintf(stderr, "ffmpeg backend: key-frame path failed, one retry\n");
-			ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_KEYONLY);
+		if (ret < 0)
+		{
+			if (!quiet)
+				fprintf(stderr, "ffmpeg backend: key-frame grab failed, retrying with fps=1/2 wait mode\n");
+			ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_WAIT);
 		}
-	}
-	else if (grab_current_service_is_iptv())
-	{
-		if (!quiet) fprintf(stderr, "ffmpeg backend: IPTV, single-frame grab\n");
-		ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_FAST);
 	}
 	else
 	{
+		/* Fast path first: no fps=1/2 throttle.  If the live join starts before
+		 * a clean access unit, retry once with the slower DreamOS-style wait filter. */
 		ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_FAST);
+		if (ret < 0)
+		{
+			if (!quiet)
+				fprintf(stderr, "ffmpeg backend: fast frame failed, retrying with fps=1/2 wait mode\n");
+			ret = grab_ffmpeg_decode_bgr24_to_buffer(input, video, out_w, out_h, GRAB_FFMPEG_FRAME_WAIT);
+		}
 	}
-	if (ret == 0) { if (xres) *xres = out_w; if (yres) *yres = out_h; }
+
+	if (ret == 0)
+	{
+		if (xres) *xres = out_w;
+		if (yres) *yres = out_h;
+	}
 	return ret;
+}
+
+static void grab_make_ffmpeg_scale(char *dst, size_t dst_len, int out_w, int out_h, int raw_bgr)
+{
+	if (raw_bgr)
+		snprintf(dst, dst_len, "fps=1/2,scale=%d:%d,format=bgr24", out_w, out_h);
+	else
+		snprintf(dst, dst_len, "fps=1/2,scale=%d:%d", out_w, out_h);
+}
+
+static int grab_ffmpeg_one_video_image(const char *input, const char *out, int out_w, int out_h, int use_png, int use_jpg, int jpg_quality)
+{
+	char vf[96];
+	char qbuf[16];
+	const char *codec = grab_ffmpeg_codec_name(use_png, use_jpg);
+	char *argv_jpg[] = {
+		"/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
+		"-i", (char *)input,
+		"-vf", vf, "-vframes", "1",
+		"-movflags", "+faststart", "-f", "image2", "-c:v", (char *)codec, "-q:v", qbuf, "-y", (char *)out, NULL
+	};
+	char *argv_other[] = {
+		"/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
+		"-i", (char *)input,
+		"-vf", vf, "-vframes", "1",
+		"-movflags", "+faststart", "-f", "image2", "-c:v", (char *)codec, "-y", (char *)out, NULL
+	};
+
+	if (!codec)
+		return -1;
+	if (out_w <= 0)
+		out_w = 1920;
+	if (out_h <= 0)
+		out_h = (out_w * 9) / 16;
+	if (out_h & 1)
+		out_h++;
+	grab_make_ffmpeg_scale(vf, sizeof(vf), out_w, out_h, 0);
+	/* Match DreamOS FreezeFrame behaviour on armhf: no tiny analyzeduration/probesize.
+	 * fps=1/2 lets ffmpeg wait for a decodable HEVC frame instead of failing on
+	 * the first packet after joining the live TS. */
+	snprintf(qbuf, sizeof(qbuf), "%d", grab_ffmpeg_quality_arg(jpg_quality));
+	return grab_run_argv(use_jpg ? argv_jpg : argv_other);
+}
+
+static int grab_ffmpeg_one_video_bmp(const char *input, const char *out, int out_w, int out_h)
+{
+	char vf[96];
+	char raw_tmp[128];
+	int ret;
+	char *argv[] = {
+		"/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
+		"-i", (char *)input,
+		"-vf", vf, "-vframes", "1",
+		"-f", "rawvideo", "-pix_fmt", "bgr24", "-y", raw_tmp, NULL
+	};
+
+	if (out_w <= 0)
+		out_w = 1920;
+	if (out_h <= 0)
+		out_h = (out_w * 9) / 16;
+	if (out_h & 1)
+		out_h++;
+
+	grab_make_ffmpeg_scale(vf, sizeof(vf), out_w, out_h, 1);
+	snprintf(raw_tmp, sizeof(raw_tmp), "/tmp/grab-ffmpeg-%ld-video.bgr", (long)getpid());
+	unlink(raw_tmp);
+
+	ret = grab_run_argv(argv);
+	if (ret == 0)
+		ret = grab_raw_bgr24_file_to_bmp(raw_tmp, out, out_w, out_h);
+	unlink(raw_tmp);
+	return ret;
+}
+
+static int grab_ffmpeg_one_video(const char *input, const char *out, int out_w, int out_h, int use_png, int use_jpg, int jpg_quality)
+{
+	if (!use_png && !use_jpg)
+		return grab_ffmpeg_one_video_bmp(input, out, out_w, out_h);
+	return grab_ffmpeg_one_video_image(input, out, out_w, out_h, use_png, use_jpg, jpg_quality);
+}
+
+static int grab_ffmpeg_one_osd(const char *out, int out_w, int out_h)
+{
+	char scale[64];
+	char *argv[] = {
+		"/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
+		"-f", "fbdev", "-i", "/dev/fb0",
+		"-frames:v", "1", "-vf", scale,
+		"-f", "image2", "-c:v", "png", "-y", (char *)out, NULL
+	};
+	if (out_w <= 0)
+		out_w = 1920;
+	if (out_h <= 0)
+		out_h = (out_w * 9) / 16;
+	if (out_h & 1)
+		out_h++;
+	snprintf(scale, sizeof(scale), "scale=%d:%d", out_w, out_h);
+	return grab_run_argv(argv);
+}
+
+static int grab_ffmpeg_overlay_image(const char *osdfile, const char *videofile, const char *out, int use_png, int use_jpg, int jpg_quality)
+{
+	char qbuf[16];
+	const char *codec = grab_ffmpeg_codec_name(use_png, use_jpg);
+	char *argv_jpg[] = {
+		"/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
+		"-i", (char *)osdfile, "-i", (char *)videofile,
+		"-filter_complex", "[1:v][0:v] overlay=0:0",
+		"-vframes", "1", "-f", "image2", "-c:v", (char *)codec, "-q:v", qbuf, "-y", (char *)out, NULL
+	};
+	char *argv_other[] = {
+		"/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
+		"-i", (char *)osdfile, "-i", (char *)videofile,
+		"-filter_complex", "[1:v][0:v] overlay=0:0",
+		"-vframes", "1", "-f", "image2", "-c:v", (char *)codec, "-y", (char *)out, NULL
+	};
+	if (!codec)
+		return -1;
+	snprintf(qbuf, sizeof(qbuf), "%d", grab_ffmpeg_quality_arg(jpg_quality));
+	return grab_run_argv(use_jpg ? argv_jpg : argv_other);
+}
+
+static int grab_ffmpeg_overlay_bmp(const char *osdfile, const char *videofile, const char *out, int out_w, int out_h)
+{
+	char raw_tmp[128];
+	int ret;
+	char *argv[] = {
+		"/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "error",
+		"-i", (char *)osdfile, "-i", (char *)videofile,
+		"-filter_complex", "[1:v][0:v] overlay=0:0,format=bgr24",
+		"-vframes", "1", "-f", "rawvideo", "-pix_fmt", "bgr24", "-y", raw_tmp, NULL
+	};
+
+	if (out_w <= 0 || out_h <= 0)
+		return -1;
+
+	snprintf(raw_tmp, sizeof(raw_tmp), "/tmp/grab-ffmpeg-%ld-all.bgr", (long)getpid());
+	unlink(raw_tmp);
+	ret = grab_run_argv(argv);
+	if (ret == 0)
+		ret = grab_raw_bgr24_file_to_bmp(raw_tmp, out, out_w, out_h);
+	unlink(raw_tmp);
+	return ret;
+}
+
+static int grab_ffmpeg_overlay(const char *osdfile, const char *videofile, const char *out, int out_w, int out_h, int use_png, int use_jpg, int jpg_quality)
+{
+	if (!use_png && !use_jpg)
+		return grab_ffmpeg_overlay_bmp(osdfile, videofile, out, out_w, out_h);
+	return grab_ffmpeg_overlay_image(osdfile, videofile, out, use_png, use_jpg, jpg_quality);
+}
+
+static int grab_ffmpeg_snapshot(const char *filename, int video_only, int osd_only, int width, int use_png, int use_jpg, int jpg_quality, const char *input_override)
+{
+	char input[4096];
+	char osd_tmp[128];
+	char video_tmp[128];
+	int src_w = 0, src_h = 0;
+	int out_w, out_h;
+	int ret = -1;
+
+	if (osd_only)
+		return -1;
+	if (!filename)
+	{
+		fprintf(stderr, "ffmpeg backend: stdout mode is not supported\n");
+		return -1;
+	}
+	if (access("/usr/bin/ffmpeg", X_OK) != 0)
+	{
+		fprintf(stderr, "ffmpeg backend: /usr/bin/ffmpeg is not executable\n");
+		return -1;
+	}
+	if (grab_get_current_stream_input(input, sizeof(input), input_override) < 0)
+	{
+		fprintf(stderr, "ffmpeg backend: could not determine current service input from local WebInterface/OpenWebif\n");
+		return -1;
+	}
+
+	grab_read_current_video_size(&src_w, &src_h);
+	out_w = width > 0 ? width : (src_w > 1920 ? 1920 : (src_w > 0 ? src_w : 1920));
+	if (out_w > 1920)
+		out_w = 1920;
+	out_h = (src_w > 0 && src_h > 0) ? (int)((long long)src_h * out_w / src_w) : (out_w * 9 / 16);
+	if (out_h <= 0)
+		out_h = out_w * 9 / 16;
+	if (out_h & 1)
+		out_h++;
+
+	if (!quiet)
+		fprintf(stderr, "ffmpeg backend: input=<stream-url> output=%dx%d file=%s%s\n", out_w, out_h, filename, grab_ffmpeg_http_headers[0] ? " headers=yes" : "");
+
+	if (video_only)
+		return grab_ffmpeg_one_video(input, filename, out_w, out_h, use_png, use_jpg, jpg_quality);
+
+	snprintf(osd_tmp, sizeof(osd_tmp), "/tmp/grab-ffmpeg-%ld-osd.png", (long)getpid());
+	snprintf(video_tmp, sizeof(video_tmp), "/tmp/grab-ffmpeg-%ld-video.png", (long)getpid());
+	unlink(osd_tmp);
+	unlink(video_tmp);
+
+	if (grab_ffmpeg_one_osd(osd_tmp, out_w, out_h) == 0 &&
+	    grab_ffmpeg_one_video(input, video_tmp, out_w, out_h, 1, 0, 100) == 0)
+		ret = grab_ffmpeg_overlay(osd_tmp, video_tmp, filename, out_w, out_h, use_png, use_jpg, jpg_quality);
+
+	unlink(osd_tmp);
+	unlink(video_tmp);
+	return ret;
+}
+
+// main program
+
+int main(int argc, char **argv)
+{
+	int xres_v = 0, yres_v = 0, xres_o = 0, yres_o = 0, xres = 0, yres = 0, aspect;
+	int c,osd_only,video_only,use_osd_res,width,use_png,use_jpg,jpg_quality,no_aspect,use_letterbox,use_ffmpeg_video_backend;
+
+	// we use fast resize as standard now
+	resize = &fast_resize;
+
+	osd_only=video_only=use_osd_res=width=use_png=use_jpg=no_aspect=use_letterbox=use_ffmpeg_video_backend=0;
+	int use_amlvideo2 = 0, amlvideo2_vd1 = 0, aml_composited_all = 0;
+	jpg_quality=50;
+	aspect=1;
+
+	int dst_left = 0, dst_top = 0, dst_width = 0, dst_height = 0;
+	int vbuf_w = 0, vbuf_h = 0;
+	int dst_is_osd_pixels = 0;   
+	int aml_axis_active   = 0; 
+	int axis_debug        = 0;
+
+	if (getenv("GRAB_AXIS_DEBUG") && *getenv("GRAB_AXIS_DEBUG"))
+		axis_debug = 1;
+
+	unsigned char *video, *osd, *output;
+	int output_bytes=3;
+	int hisi_composited_all = 0;
+
+	const char* filename = "/tmp/screenshot.bmp";
+
+	// detect STB
+	char buf[256];
+	FILE *fp = fopen("/proc/fb","r");
+	if (!fp)
+	{
+		fprintf(stderr, "No framebuffer, unknown STB .. quit.\n");
+		return 1;
+	}
+
+	while (fgets(buf,sizeof(buf),fp))
+	{
+		if (strcasestr(buf,"VULCAN")) stb_type=VULCAN;
+		if (strcasestr(buf,"PALLAS")) stb_type=PALLAS;
+		if (strcasestr(buf,"XILLEON")) stb_type=XILLEON;
+		if (strcasestr(buf,"EM863x")) stb_type=AZBOX863x;
+		if (strcasestr(buf,"EM865x")) stb_type=AZBOX865x;
+#if defined(__sh__)
+		if (strcasestr(buf,"STi") || strcasestr(buf,"STx")) stb_type=ST;
+#endif
+	}
+	fclose(fp);
+	
+	if (stb_type == UNKNOWN)
+	{
+		FILE *file = fopen("/proc/stb/info/vumodel", "r");
+		if (file)
+		{
+			char buf[32];
+			while (fgets(buf, sizeof(buf), file))
+			{
+				if (strcasestr(buf,"zero4k"))
+				{
+					stb_type = BRCM72604VU;
+					break;
+				}
+			}
+			fclose(file);
+		}
+	}
+
+	if (stb_type == UNKNOWN)
+	{
+		FILE *file = fopen("/proc/stb/info/boxtype", "r");
+		if (file)
+		{
+			char buf[32];
+			while (fgets(buf, sizeof(buf), file))
+			{
+				if (strcasestr(buf,"osmio4k"))
+				{
+					stb_type = BRCM72604VU;
+					break;
+				}
+			}
+			fclose(file);
+		}
+	}
+
+	if (stb_type == UNKNOWN)
+	{
+		FILE *file = fopen("/proc/stb/info/hwmodel", "r");
+		if (file)
+		{
+			char buf[32];
+			while (fgets(buf, sizeof(buf), file))
+			{
+				if (strcasestr(buf,"force3"))
+				{
+					stb_type = BRCM7439DAGS;
+					break;
+				}
+				if (strcasestr(buf,"force3se"))
+				{
+					stb_type = BRCM7439DAGS;
+					break;
+				}
+				if (strcasestr(buf,"force3uhd"))
+				{
+					stb_type = BRCM7439DAGS;
+					break;
+				}
+				if (strcasestr(buf,"force3uhdplus"))
+				{
+					stb_type = BRCM7439DAGS;
+					break;
+				}
+				if (strcasestr(buf,"tmtwin4k"))
+				{
+					stb_type = BRCM7439DAGS;
+					break;
+				}
+				if (strcasestr(buf,"revo4k"))
+				{
+					stb_type = BRCM7439DAGS;
+					break;
+				}
+				if (strcasestr(buf,"galaxy4k"))
+				{
+					stb_type = BRCM7439DAGS;
+					break;
+				}
+				if (strcasestr(buf,"tm4ksuper"))
+				{
+					stb_type = BRCM7439DAGS;
+					break;
+				}
+				if (strcasestr(buf,"lunix3-4k"))
+				{
+					stb_type = BRCM7439DAGS;
+					break;
+				}
+				if (strcasestr(buf,"valalinux4k"))
+				{
+					stb_type = BRCM7439DAGS;
+					break;
+				}
+			}
+			fclose(file);
+		}
+	}
+
+	if (stb_type == UNKNOWN)
+	{
+		FILE *file = fopen("/proc/stb/info/chipset", "r");
+		if (file)
+		{
+			char buf[32];
+			while (fgets(buf, sizeof(buf), file))
+			{
+				if (strstr(buf,"7400"))
+				{
+					stb_type = BRCM7400;
+					break;
+				}
+				else if (strstr(buf,"7401"))
+				{
+					stb_type = BRCM7401;
+					break;
+				}
+				else if (strstr(buf,"7403"))
+				{
+					stb_type = BRCM7401;
+					break;
+				}
+				else if (strstr(buf,"7405"))
+				{
+					stb_type = BRCM7405;
+					break;
+				}
+				else if (strstr(buf,"7413"))
+				{
+					stb_type = BRCM7405;
+					break;
+				}
+				else if (strstr(buf,"7335"))
+				{
+					stb_type = BRCM7335;
+					break;
+				}
+				else if (strstr(buf,"7325"))
+				{
+					stb_type = BRCM7325;
+					break;
+				}
+				else if (strstr(buf,"7346"))
+				{
+					stb_type = BRCM7346;
+					break;
+				}
+				else if (strstr(buf,"7358"))
+				{
+					stb_type = BRCM7358;
+					break;
+				}
+				else if (strstr(buf,"73625"))
+				{
+					stb_type = BRCM73625;
+					break;
+				}
+				else if (strstr(buf,"7362"))
+				{
+					stb_type = BRCM7362;
+					break;
+				}
+				else if (strstr(buf,"7241"))
+				{
+					stb_type = BRCM7241;
+					break;
+				}
+				else if (strstr(buf,"7251"))
+				{
+					stb_type = BRCM7251;
+					break;
+				}
+				else if (strstr(buf,"7252"))
+				{
+					stb_type = BRCM7252;
+					break;
+				}
+				else if (strstr(buf,"7252S"))
+				{
+					stb_type = BRCM7252S;
+					break;
+				}
+				else if (strstr(buf,"7278"))
+				{
+					stb_type = BRCM7278;
+					break;
+				}
+				else if (strstr(buf,"73565"))
+				{
+					stb_type = BRCM73565;
+					break;
+				}
+				else if (strstr(buf,"7356"))
+				{
+					stb_type = BRCM7356;
+					break;
+				}
+				else if (strstr(buf,"7424"))
+				{
+					stb_type = BRCM7424;
+					break;
+				}
+				else if (strstr(buf,"7425"))
+				{
+					stb_type = BRCM7425;
+					break;
+				}
+				else if (strstr(buf,"7435"))
+				{
+					stb_type = BRCM7435;
+					break;
+				}
+				else if (strstr(buf,"7444"))
+				{
+					stb_type = BRCM7444;
+					break;
+				}
+				else if (strstr(buf,"7552"))
+				{
+					stb_type = BRCM7552;
+					break;
+				}
+				else if (strstr(buf,"7581"))
+				{
+					stb_type = BRCM7581;
+					break;
+				}
+				else if (strstr(buf,"7583"))
+				{
+					stb_type = BRCM7583;
+					break;
+				}
+				else if (strstr(buf,"72604"))
+				{
+					stb_type = BRCM72604;
+					break;
+				}
+				else if (strstr(buf,"75845"))
+				{
+					stb_type = BRCM75845;
+					break;
+				}
+				else if (strstr(buf,"7584"))
+				{
+					stb_type = BRCM7584;
+					break;
+				}
+				else if (strstr(buf,"7366"))
+				{
+					stb_type = BRCM7366;
+					break;
+				}
+				else if (strstr(buf,"7376"))
+				{
+					stb_type = BRCM7366;
+					break;
+				}
+				else if (strstr(buf,"hi3798") || strstr(buf,"hi3716"))
+				{
+					/* Legacy HiSilicon images report e.g. "hi3798mv200" or
+					 * "hi3716mv430" and must stay on the existing HISIL_ARM
+					 * path. New-format HiSi chipset strings do not have the
+					 * leading "hi" prefix and are routed per chip below.
+					 */
+					stb_type = HISIL_ARM;
+					break;
+				}
+				else if (strstr(buf,"3716mv410"))
+				{
+					stb_type = HISI_3716MV410;
+					break;
+				}
+				else if (strstr(buf,"3716mv430"))
+				{
+					stb_type = HISI_3716MV430;
+					break;
+				}
+				else if (strstr(buf,"3798cv200"))
+				{
+					stb_type = HISI_3798CV200;
+					break;
+				}
+				else if (strstr(buf,"3798mv200"))
+				{
+					stb_type = HISI_3798MV200;
+					break;
+				}
+				else if (strstr(buf,"3798mv300"))
+				{
+					stb_type = HISI_3798MV300;
+					break;
+				}
+				else if (strstr(buf,"Meson-6") || strstr(buf,"Meson-64"))
+				{
+					stb_type = WETEK;
+					break;
+				}
+			}
+			fclose(file);
+		}
+	}
+
+	if (stb_type == UNKNOWN)
+	{
+		FILE *file = fopen("/proc/stb/info/model", "r");
+		if (file)
+		{
+			char buf[32];
+			while (fgets(buf, sizeof(buf), file))
+			{
+				if (strcasestr(buf,"DM500HD") || strcasestr(buf,"DM800SE") || strcasestr(buf,"DM7020HD"))
+				{
+					stb_type = BRCM7405;
+					break;
+				}
+				else if (strcasestr(buf,"DM7080") || strcasestr(buf,"DM820"))
+				{
+					stb_type = BRCM7435;
+					break;
+				}
+				else if (strcasestr(buf, "DM520") || strcasestr(buf,"DM525"))
+				{
+					stb_type = BRCM73625;
+					break;
+				}
+				else if (strcasestr(buf,"DM8000"))
+				{
+					stb_type = BRCM7400;
+					break;
+				}
+				else if (strcasestr(buf,"DM800"))
+				{
+					stb_type = BRCM7401;
+					break;
+				}
+				else if (strcasestr(buf,"DM900") || strcasestr(buf,"DM920"))
+				{
+					stb_type = BRCM7439;
+					break;
+				}
+				else if (strcasestr(buf,"ONE") || strcasestr(buf,"TWO"))
+				{
+					stb_type = DMNEW;
+					break;
+				}
+			}
+			fclose(file);
+		}
+	}
+
+	if (stb_type == UNKNOWN)
+	{
+		fprintf(stderr, "unknown stb type we can only capture osd\n");
+		osd_only=1;
+	}
+
+	switch (stb_type)
+	{
+		case BRCM7400:
+			registeroffset = 0x10100000;
+			chr_luma_stride = 0x40;
+			chr_luma_register_offset = 0x20;
+			mem2memdma_register = 0x10c02000;
+			break;
+		case BRCM7401:
+			registeroffset = 0x10100000;
+			chr_luma_stride = 0x40;
+			chr_luma_register_offset = 0x20;
+			mem2memdma_register = 0;
+			break;
+		case BRCM7325:
+		case BRCM7405:
+			registeroffset = 0x10100000;
+			chr_luma_stride = 0x80;
+			chr_luma_register_offset = 0x20;
+			mem2memdma_register = 0;
+			break;
+		case BRCM7335:
+			registeroffset = 0x10100000;
+			chr_luma_stride = 0x40;
+			chr_luma_register_offset = 0x20;
+			mem2memdma_register = 0x10c01000;
+			break;
+		case BRCM7358:
+		case BRCM7362:
+		case BRCM73625:
+		case BRCM7366:
+		case BRCM7444:
+		case BRCM7552:
+		case BRCM7251:
+		case BRCM7252:
+		case BRCM7252S:
+		case BRCM7278:
+		case BRCM7581:
+		case BRCM7584:
+		case BRCM72604VU:
+		case BRCM75845:
+			registeroffset = 0x10600000;
+			chr_luma_stride = 0x40;
+			chr_luma_register_offset = 0x34;
+			mem2memdma_register = 0;
+			break;
+		case BRCM72604:
+		case BRCM7439DAGS:
+			registeroffset = 0xf0600000;
+			chr_luma_stride = 0x100;
+			chr_luma_register_offset = 0x34;
+			mem2memdma_register = 0;
+			break;
+		case BRCM7241:
+		case BRCM7583:
+		case BRCM7346:
+		case BRCM7356:
+		case BRCM73565:
+		case BRCM7424:
+		case BRCM7425:
+		case BRCM7435:
+			registeroffset = 0x10600000;
+			chr_luma_stride = 0x80;
+			chr_luma_register_offset = 0x34;
+			mem2memdma_register = 0;
+			break;
+		case BRCM7439:
+			registeroffset = 0xf0600000;
+			chr_luma_stride = 0x80;
+			chr_luma_register_offset = 0x34;
+			mem2memdma_register = 0;
+			break;
+		default:
+			break;
+	}
+
+	// process command line
+	while ((c = getopt (argc, argv, "dhj:lbnopqr:svi:")) != -1)
+	{
+		switch (c)
+		{
+			case 'h':
+			case '?':
+				fprintf(stderr,
+					"Usage: grab [commands] [filename]\n\n"
+					"command:\n"
+					"-o only grab osd (e2egl/framebuffer) when using this with png or bmp\n"
+					"   fileformat you will get a 32bit pic with alphachannel\n"
+					"-v only grab video\n"
+					"-i (video device) to grab video (default 0)\n"
+					"-d always use osd resolution (good for skinshots)\n"
+					"-n dont correct 16:9 aspect ratio\n"
+					"-r (size) resize to a fixed width, maximum: 1920, 3840 on e2egl/UHD boxes\n"
+					"-l always 4:3, create letterbox if 16:9\n"
+					"-b use bicubic picture resize (slow but smooth)\n"
+					"-j (quality) produce jpg files instead of bmp (quality 0-100)\n"
+					"-p produce png files instead of bmp\n"
+					"-q Quiet mode, don't output debug messages\n"
+					"-s write to stdout instead of a file\n"
+					"-h this help screen\n\n"
+					"If no command is given the complete picture will be grabbed.\n"
+					"If no filename is given /tmp/screenshot.[bmp/jpg/png] will be used.\n");
+				return 1;
+			case 'o': // OSD only
+				osd_only=1;
+				video_only=0;
+				break;
+			case 'v': // Video only
+				video_only=1;
+				osd_only=0;
+				break;
+			case 'i': // Video device
+				video_dev=atoi(optarg);
+				break;
+			case 'd': // always use OSD resolution
+				use_osd_res=1;
+				no_aspect=1;
+				break;
+			case 'q': // quiet
+				++quiet;
+				break;
+			case 'r': // use given resolution
+				width=atoi(optarg);
+				{
+					int max_resize_width = (stb_supports_uhd_grab_buffers() || e2egl_capture_available()) ? 3840 : 1920;
+					if (width > max_resize_width)
+					{
+						fprintf(stderr, "Error: -r (size) is limited to %d pixels!\n", max_resize_width);
+						return 1;
+					}
+				}
+				break;
+			case 's': // stdout
+				filename = NULL;
+				break;
+			case 'l': // create letterbox
+				use_letterbox=1;
+				break;
+			case 'b': // use bicubic resizing
+				resize = &smooth_resize;
+				break;
+			case 'p': // use png file format
+				use_png=1;
+				use_jpg=0;
+				if (filename)
+					filename = "/tmp/screenshot.png";
+				break;
+			case 'j': // use jpg file format
+				use_jpg=1;
+				use_png=0;
+				jpg_quality=atoi(optarg);
+				if (filename)
+					filename = "/tmp/screenshot.jpg";
+				break;
+			case 'n':
+				no_aspect=1;
+				break;
+		}
+	}
+	if (optind < argc) // filename
+		filename = argv[optind];
+
+	/* Use the DreamOS-style ffmpeg stream backend only for the video plane.
+	 * The decoded BGR frame is handed back to aio-grab, so normal BMP/JPG/PNG,
+	 * stdout mode (-s), OSD capture and the existing C combiner still work.
+	 * This is faster for OpenWebif than spawning ffmpeg again for OSD/overlay. */
+	if (!osd_only)
+	{
+		int src_w = 0, src_h = 0;
+		int auto_ffmpeg = grab_ffmpeg_backend_should_autouse(&src_w, &src_h);
+		use_amlvideo2 = amlvideo2_usable();
+		amlvideo2_vd1 = use_amlvideo2 && amlvideo2_vd1_usable();
+		/* amlvideo2 covers the screen grabs; the raw path reads the remaining
+		 * upscaled video only grabs fine unless the frame is AFBC compressed */
+		if (auto_ffmpeg && use_amlvideo2 && !grab_current_video_is_hevc() && src_w <= 1920 && src_h <= 1080)
+			auto_ffmpeg = 0;
+		/* amlvideo2 returns the picture in display size, up to UHD; ffmpeg
+		 * stays as the fallback */
+		int amlvideo2_grabs = use_amlvideo2 && (!video_only || amlvideo2_vd1);
+		if (auto_ffmpeg)
+		{
+			use_ffmpeg_video_backend = 1;
+			/* OpenWebif/grab callers keep the normal syntax. For UHD sources force the
+			 * capture plane down to HD so a plain "grab -v" does not generate a
+			 * huge 3840x2160 image. Explicit -r values above HD are clamped later by
+			 * the ffmpeg backend as well. */
+			if (!amlvideo2_grabs && (src_w > 1920 || src_h > 1080) && (!width || width > 1920))
+				width = 1920;
+			if (!quiet && !amlvideo2_grabs)
+				fprintf(stderr, "Using ffmpeg backend for Dream HEVC/UHD/SD video capture ...\n");
+		}
+	}
+
+	size_t mallocsize = 1920U * 1080U;
+
+	if (e2egl_capture_available() || stb_supports_uhd_grab_buffers())
+		mallocsize = E2EGL_CAPTURE_MAX_PIXELS;
+	else if (stb_type == VULCAN || stb_type == PALLAS)
+		mallocsize = 720U * 576U;
+
+	video = (unsigned char *)malloc(mallocsize * 3U);
+	osd = (unsigned char *)malloc(mallocsize * 4U);
+
+	if ((stb_type == VULCAN || stb_type == PALLAS) && width > 720)
+		mallocsize = (size_t)width * (size_t)(width * 0.8 + 1);
+
+	output = (unsigned char *)malloc(mallocsize * 4U);
+
+	if (!video || !osd || !output)
+	{
+		fprintf(stderr, "Out of memory while allocating capture buffers\n");
+		free(video);
+		free(osd);
+		free(output);
+
+		/* Close HiSi libs last - their destructors corrupt the heap */
+		if (hisi_lib_msp)    dlclose(hisi_lib_msp);
+		if (hisi_lib_common) dlclose(hisi_lib_common);
+
+		return 1;
+	}
+
+	/*
+	 * 3798mv200/mv300: DISP snapshot already contains the hardware-composed
+	 * video+OSD image. In all/default mode use that image directly instead
+	 * of blending the framebuffer a second time.
+	 */
+	if (hisi_uses_composited_snapshot() && !video_only && !osd_only)
+	{
+		hisi_composited_all = 1;
+		if (!quiet)
+			fprintf(stderr, "HiSi 3798: using composed DISP snapshot for all-mode, skipping second OSD blend\n");
+	}
+
+	hisi_grab_request_video_only = video_only;
+
+	if (use_amlvideo2 && !video_only && !osd_only &&
+	    getvideo_amlvideo2(video, &xres_v, &yres_v, AMLV2_PORT_VIU1_WB0_POST_BLEND) == 0)
+	{
+		aml_composited_all = 1;
+		if (!quiet)
+			fprintf(stderr, "Screen grabbed via amlvideo2 (%dx%d)\n", xres_v, yres_v);
+	}
+
+	// get osd
+	if (!video_only && !hisi_composited_all && !aml_composited_all)
+		getosd(osd,&xres_o,&yres_o);
+
+	if (!video_only && !hisi_composited_all && !aml_composited_all && (xres_o <= 0 || yres_o <= 0))
+	{
+		if (osd_only)
+		{
+			fprintf(stderr, "OSD grab failed or returned empty frame; not writing a fake 0x0 image\n");
+			free(video);
+			free(osd);
+			free(output);
+			if (hisi_lib_msp)    dlclose(hisi_lib_msp);
+			if (hisi_lib_common) dlclose(hisi_lib_common);
+			return 1;
+		}
+		fprintf(stderr, "OSD grab failed or returned empty frame; falling back to video-only screenshot\n");
+		video_only = 1;
+	}
+
+	// get video
+	if (!osd_only && !aml_composited_all)
+	{
+		if (!quiet)
+			fprintf(stderr, "Grabbing Video ...\n");
+		if (amlvideo2_vd1 && getvideo_amlvideo2(video, &xres_v, &yres_v, AMLV2_PORT_VIU1_WB0_VD1) == 0)
+		{
+			if (!quiet)
+				fprintf(stderr, "Video grabbed via amlvideo2 (%dx%d)\n", xres_v, yres_v);
+		}
+		else if (use_ffmpeg_video_backend)
+		{
+			if (grab_ffmpeg_getvideo_frame(video, &xres_v, &yres_v, width, NULL) < 0)
+				fprintf(stderr, "ffmpeg backend failed; refusing unsafe raw HEVC/UHD/SD video grab\n");
+		}
+		else if (stb_type == BRCM7366 || stb_type == BRCM7251 || stb_type == BRCM7252 || stb_type == BRCM7252S || stb_type == BRCM7444 || stb_type == BRCM72604VU || stb_type == BRCM7278 || stb_type == HISIL_ARM)
+		{
+			getvideo2(video, &xres_v,&yres_v);
+		}
+		else if (hisi_uses_chip_backend())
+		{
+			getvideo_hisi(video, &xres_v, &yres_v);
+		}
+		else
+		{
+			getvideo(video,&xres_v,&yres_v);
+		}
+	}
+
+	if (!osd_only && (xres_v <= 0 || yres_v <= 0))
+	{
+		if (video_only)
+		{
+			fprintf(stderr, "Video grab failed or returned empty frame; not writing a fake 0x0 image\n");
+			free(video);
+			free(osd);
+			free(output);
+			if (hisi_lib_msp)    dlclose(hisi_lib_msp);
+			if (hisi_lib_common) dlclose(hisi_lib_common);
+			return 1;
+		}
+		fprintf(stderr, "Video grab failed or returned empty frame; falling back to OSD-only screenshot\n");
+		osd_only = 1;
+	}
+
+	if (osd_only)
+	{
+		xres = xres_o;
+		yres = yres_o;
+		memcpy(output, osd, (size_t)xres * (size_t)yres * 4);
+		output_bytes = 4;
+		dst_left   = 0;
+		dst_top    = 0;
+		dst_width  = xres;
+		dst_height = yres;
+		goto post_merge;
+	}
+
+	if (hisi_composited_all || aml_composited_all)
+	{
+		if (xres_v <= 0 || yres_v <= 0)
+		{
+			fprintf(stderr, "HiSi 3798: composed snapshot failed, empty video frame\n");
+			xres = 0;
+			yres = 0;
+		}
+		else
+		{
+			xres = xres_v;
+			yres = yres_v;
+			memcpy(output, video, (size_t)xres * (size_t)yres * 3U);
+			output_bytes = 3;
+		}
+		dst_left   = 0;
+		dst_top    = 0;
+		dst_width  = xres;
+		dst_height = yres;
+		goto post_merge;
+	}
+
+	// get aspect ratio
+	if (stb_type == VULCAN || stb_type == PALLAS)
+	{
+		fp = fopen("/proc/bus/bitstream","r");
+		if (fp)
+		{
+			while (fgets(buf,sizeof(buf),fp))
+				sscanf(buf,"A_RATIO: %d",&aspect);
+			fclose(fp);
+		}
+	}
+	else
+	{
+		fp = fopen("/proc/stb/vmpeg/0/aspect", "r");
+		if (fp)
+		{
+			while (fgets(buf,sizeof(buf), fp))
+				sscanf(buf,"%x",&aspect);
+			fclose(fp);
+		}
+		fp = fopen("/proc/stb/vmpeg/0/dst_width", "r");
+		if (fp)
+		{
+			while (fgets(buf,sizeof(buf), fp))
+				sscanf(buf,"%x",&dst_width);
+			fclose(fp);
+		}
+		fp = fopen("/proc/stb/vmpeg/0/dst_height", "r");
+		if (fp)
+		{
+			while (fgets(buf,sizeof(buf), fp))
+				sscanf(buf,"%x",&dst_height);
+			fclose(fp);
+		}
+		fp = fopen("/proc/stb/vmpeg/0/dst_top", "r");
+		if (fp)
+		{
+			while (fgets(buf,sizeof(buf), fp))
+				sscanf(buf,"%x",&dst_top);
+			fclose(fp);
+		}
+		fp = fopen("/proc/stb/vmpeg/0/dst_left", "r");
+		if (fp)
+		{
+			while (fgets(buf,sizeof(buf), fp))
+				sscanf(buf,"%x",&dst_left);
+			fclose(fp);
+		}
+		if (dst_width == 720) dst_width = 0;
+		if (dst_height == 576) dst_height = 0;
+	}
+
+	// resizing
+ 	if (video_only)
+	{
+		xres=xres_v;
+		yres=yres_v;
+	}
+	else if (osd_only)
+	{
+		xres=xres_o;
+		yres=yres_o;
+	}
+	else if (xres_o == xres_v && yres_o == yres_v && !dst_top && !dst_left && !dst_width && !dst_height)
+	{
+		xres=xres_v;
+		yres=yres_v;
+	}
+	else
+	{
+		if (xres_v > xres_o && !use_osd_res && (width == 0 || width > xres_o)) {
+			// resize osd to video size
+			xres = xres_v;
+			yres = yres_v;
+		} else {
+			// resize video to osd size
+			xres = xres_o;
+			yres = yres_o;
+		}
+
+		/* ============ AML axis mapping (MiniTV / PiG / PiP) =================
+		* RUN THIS AFTER xres/yres are known. If axis_pip (or axis) reports
+		* a valid rectangle, it is already in desktop pixels. Use it directly
+		* and prevent the legacy 720x576 remap from running.
+		* ==================================================================== */
+		if (stb_type == DMNEW) {
+			if (aml_pick_axis(&dst_left, &dst_top, &dst_width, &dst_height)) {
+				char res[32];
+				int disp_w = 0, disp_h = 0;
+
+				/* the axis is in display pixels */
+				if (grab_read_text_file("/sys/class/video/device_resolution", res, sizeof(res)) == 0 &&
+				    sscanf(res, "%dx%d", &disp_w, &disp_h) == 2 && disp_w > 0 && disp_h > 0 &&
+				    (disp_w != xres || disp_h != yres)) {
+					dst_left   = (int)((long long)dst_left   * xres / disp_w);
+					dst_width  = (int)((long long)dst_width  * xres / disp_w);
+					dst_top    = (int)((long long)dst_top    * yres / disp_h);
+					dst_height = (int)((long long)dst_height * yres / disp_h);
+				}
+				clamp_rect(&dst_left, &dst_top, &dst_width, &dst_height, xres, yres);
+				dst_is_osd_pixels = 1;
+				aml_axis_active   = 1;
+				if (axis_debug)
+					fprintf(stderr, "[AML axis] dst=%d,%d %dx%d shot=%dx%d\n", dst_left, dst_top, dst_width, dst_height, xres, yres);
+			}
+		}
+		if (dst_top || dst_left || dst_width || dst_height)
+		{
+			/* Legacy-Crop (Broadcom etc.) in 720x576 => OSD-Pixel */
+			if (!dst_is_osd_pixels) {
+				if (dst_width == 0)  dst_width  = 720;
+				if (dst_height == 0) dst_height = 576;
+				dst_top    = (int)((long long)dst_top    * yres / 576);
+				dst_height = (int)((long long)dst_height * yres / 576);
+				dst_left   = (int)((long long)dst_left   * xres / 720);
+				dst_width  = (int)((long long)dst_width  * xres / 720);
+			}
+		}
+		else
+		{
+			dst_left = 0;
+			dst_top  = 0;
+			dst_width  = xres;
+			dst_height = yres;
+		}
+
+		vbuf_w = dst_width;
+		vbuf_h = dst_height;
+
+		if (xres_o != xres || yres_o != yres)
+		{
+			if (!quiet)
+				fprintf(stderr, "Resizing OSD to %d x %d ...\n", xres, yres);
+
+			fprintf(stderr, "before resize\n");
+			resize(osd, output, xres_o, yres_o, xres, yres, 4);
+			fprintf(stderr, "after resize\n");  // kommt das?
+
+			//resize(osd, output, xres_o, yres_o, xres, yres, 4);
+			memcpy(osd, output, xres * yres * 4);
+		}
+
+		if (xres_v != vbuf_w || yres_v != vbuf_h)
+		{
+			if (!quiet)
+				fprintf(stderr, "Resizing Video to %d x %d ...\n", vbuf_w, vbuf_h);
+			resize(video, output, xres_v, yres_v, vbuf_w, vbuf_h, 3);
+			memcpy(video, output, vbuf_w * vbuf_h * 3);
+			xres_v = vbuf_w;
+			yres_v = vbuf_h;
+		}
+	}
+
+	// merge video and osd if neccessary
+	if (video_only)
+	{
+		memcpy(output,video,xres*yres*3);
+	}
+	else
+	{
+		if (!quiet)
+			fprintf(stderr, "Merge Video with Framebuffer ...\n");
+
+			if (aml_axis_active && axis_debug) {
+				fprintf(stderr, "[combine] dst=%d,%d %dx%d  vbuf=%dx%d  out=%dx%d\n", dst_left, dst_top, dst_width, dst_height, vbuf_w, vbuf_h, xres, yres);
+			}
+
+			combine(output, video, osd, dst_left, dst_top, vbuf_w ? vbuf_w : xres, vbuf_h ? vbuf_h : yres, xres, yres);
+	}
+
+post_merge:
+
+
+	// resize to specific width ?
+	if (width && width != xres)
+	{
+		if (!quiet)
+			fprintf(stderr, "Resizing Screenshot to %d x %d ...\n",width,yres*width/xres);
+		resize(output,osd,xres,yres,width,(yres*width/xres),output_bytes);
+		yres=yres*width/xres;
+		xres=width;
+		memcpy(output,osd,xres*yres*output_bytes);
+	}
+
+	// correct aspect ratio
+	if (!no_aspect && aspect == 3 && ((float)xres/(float)yres)<1.5)
+	{
+		if (!quiet)
+			fprintf(stderr, "Correct aspect ratio to 16:9 ...\n");
+		resize(output,osd,xres,yres,xres,yres/1.42,output_bytes);
+		yres/=1.42;
+		memcpy(output,osd,xres*yres*output_bytes);
+	}
+
+	// use letterbox ?
+	if (use_letterbox && xres*0.8 != yres && xres*0.8 <= 1080)
+	{
+		int yres_neu;
+		yres_neu=xres*0.8;
+		if (!quiet)
+			fprintf(stderr, "Create letterbox %d x %d ...\n",xres,yres_neu);
+		if (yres_neu > yres)
+		{
+			int ofs;
+			ofs=(yres_neu-yres)>>1;
+			memmove(output+ofs*xres*output_bytes,output,xres*yres*output_bytes);
+			memset(output,0,ofs*xres*output_bytes);
+			memset(output+ofs*xres*3+xres*yres*output_bytes,0,ofs*xres*output_bytes);
+		}
+		yres=yres_neu;
+	}
+
+	// saving picture
+	if (!quiet)
+			fprintf(stderr, "Saving %d bit %s ...\n",(use_jpg?3*8:output_bytes*8), filename ? filename : "<stdout>");
+	FILE *fd2;
+	if (filename)
+	{
+		fd2 = fopen(filename, "wb");
+		if (!fd2)
+		{
+			fprintf(stderr, "Failed to open '%s' for output\n", filename);
+			return 1;
+		}
+	}
+	else
+		fd2 = stdout;
+
+	if (!use_png && !use_jpg)
+	{
+		// write bmp
+		unsigned char hdr[14 + 40];
+		int i = 0;
+#define PUT32(x) hdr[i++] = ((x)&0xFF); hdr[i++] = (((x)>>8)&0xFF); hdr[i++] = (((x)>>16)&0xFF); hdr[i++] = (((x)>>24)&0xFF);
+#define PUT16(x) hdr[i++] = ((x)&0xFF); hdr[i++] = (((x)>>8)&0xFF);
+#define PUT8(x) hdr[i++] = ((x)&0xFF);
+		PUT8('B'); PUT8('M');
+		PUT32((((xres * yres) * 3 + 3) &~ 3) + 14 + 40);
+		PUT16(0); PUT16(0); PUT32(14 + 40);
+		PUT32(40); PUT32(xres); PUT32(yres);
+		PUT16(1);
+		PUT16(output_bytes*8); // bits
+		PUT32(0); PUT32(0); PUT32(0); PUT32(0); PUT32(0); PUT32(0);
+#undef PUT32
+#undef PUT16
+#undef PUT8
+		fwrite(hdr, 1, i, fd2);
+
+		int y;
+		for (y=yres-1; y>=0 ; y-=1)
+			fwrite(output+(y*xres*output_bytes),xres*output_bytes,1,fd2);
+	}
+	else if (use_png)
+	{
+		// write png
+		png_bytep *row_pointers;
+		png_structp png_ptr;
+		png_infop info_ptr;
+
+		png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, (png_voidp)NULL, (png_error_ptr)NULL, (png_error_ptr)NULL);
+		info_ptr = png_create_info_struct(png_ptr);
+		png_init_io(png_ptr, fd2);
+
+		row_pointers=(png_bytep*)malloc(sizeof(png_bytep)*yres);
+
+		int y;
+		for (y=0; y<yres; y++)
+			row_pointers[y]=output+(y*xres*output_bytes);
+
+		png_set_bgr(png_ptr);
+		png_set_IHDR(png_ptr, info_ptr, xres, yres, 8, ((output_bytes<4)?PNG_COLOR_TYPE_RGB:PNG_COLOR_TYPE_RGBA) , PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_BASE, PNG_FILTER_TYPE_BASE);
+		png_write_info(png_ptr, info_ptr);
+		png_write_image(png_ptr, row_pointers);
+		png_write_end(png_ptr, info_ptr);
+		png_destroy_write_struct(&png_ptr, &info_ptr);
+
+		free(row_pointers);
+	}
+	else
+	{
+		const int row_stride = xres * output_bytes;
+		// write jpg
+		if (output_bytes == 3) // swap bgr<->rgb
+		{
+			int y;
+			
+			#pragma omp parallel for shared(output)
+			for (y=0; y<yres; y++)
+			{
+				int xres1=y*xres*3;
+				int xres2=xres1+2;
+				int x;
+				for (x=0; x<xres; x++)
+				{
+					int x2=x*3;
+					SWAP(output[x2+xres1],output[x2+xres2]);
+				}
+			}
+		}
+		else // swap bgr<->rgb and eliminate alpha channel jpgs are always saved with 24bit without alpha channel
+		{
+			int y;
+			#pragma omp parallel for shared(output)
+			for (y=0; y<yres; y++)
+			{
+				unsigned char *scanline = output + (y * row_stride);
+				int x;
+				for (x=0; x<xres; x++)
+				{
+					const int xs = x * 4;
+					const int xd = x * 3;
+					scanline[xd + 0] = scanline[xs + 2];
+					scanline[xd + 1] = scanline[xs + 1];
+					scanline[xd + 2] = scanline[xs + 0];
+				}
+			}
+		}
+
+		struct jpeg_compress_struct cinfo;
+		struct jpeg_error_mgr jerr;
+		JSAMPROW row_pointer[1];
+		cinfo.err = jpeg_std_error(&jerr);
+
+		jpeg_create_compress(&cinfo);
+		jpeg_stdio_dest(&cinfo, fd2);
+		cinfo.image_width = xres;
+		cinfo.image_height = yres;
+		cinfo.input_components = 3;
+		cinfo.in_color_space = JCS_RGB;
+		cinfo.dct_method = JDCT_IFAST;
+		jpeg_set_defaults(&cinfo);
+		jpeg_set_quality(&cinfo,jpg_quality, TRUE);
+		jpeg_start_compress(&cinfo, TRUE);
+		while (cinfo.next_scanline < cinfo.image_height)
+		{
+			row_pointer[0] = & output[cinfo.next_scanline * row_stride];
+			(void) jpeg_write_scanlines(&cinfo, row_pointer, 1);
+		}
+		jpeg_finish_compress(&cinfo);
+		jpeg_destroy_compress(&cinfo);
+	}
+
+	if (filename)
+		fclose(fd2);
+
+	// Thats all folks
+	if (!quiet)
+		fprintf(stderr, "... Done !\n");
+
+	// clean up
+	free(video);
+	free(osd);
+	free(output);
+    /* Close HiSi libs last - their destructors corrupt the heap */
+    if (hisi_lib_msp)    dlclose(hisi_lib_msp);
+    if (hisi_lib_common) dlclose(hisi_lib_common);
+	return 0;
+}
+
+
+/* ============================================================
+ * HiSilicon video grab backends
+ *
+ * 3798cv200:
+ *   HI_UNF_DISP_AcquireSnapshot() returns a YUV420 semi-planar frame.
+ *
+ * 3798mv200 / 3798mv300:
+ *   HI_UNF_DISP_AcquireSnapshot() returns a YUV420 semi-planar frame but can
+ *   already contain the hardware-composed video+OSD output.  For all/default
+ *   mode that composed snapshot is useful and avoids a second software blend.
+ *   For video-only mode first try the VO/window capture path, because that is
+ *   the only plausible way to get the video plane before OSD composition.  If
+ *   VO capture fails, fall back to DISP snapshot and warn that the result may
+ *   still contain OSD.
+ *   Some vendor grabs map only u32YAddr and derive chroma by
+ *   u32CAddr - u32YAddr because u32CAddr may not be page-aligned.
+ *
+ * 3716mv430:
+ *   HI_UNF_DISP_AcquireSnapshot() is not the correct video path.
+ *   The vendor grab binary uses:
+ *     HI_SYS_Init
+ *     HI_UNF_DISP_Init
+ *     HI_UNF_VO_Init
+ *     HI_MPI_WIN_GetHandle(&winInfo)
+ *     HI_UNF_VO_CapturePicture(hWin, &cap)
+ *     HI_TDE2_MbBlit(...)
+ *     HI_MMZ_Map(dstPhys)
+ *   The captured picture is macroblock/tiled YUV, so CPU NV21 conversion is
+ *   not sufficient. TDE must de-tile/convert it to a linear BGR888/RGB888 buffer.
+ *
+ * 3716mv410:
+ *   Old vendor grab -v triggers /proc/msp/win0100 capture and reads the
+ *   generated planar YUV420 file from /home/capturevideo.
+ * ============================================================ */
+
+/* HiSilicon basic types */
+typedef unsigned int   HI_U32;
+typedef unsigned char  HI_U8;
+typedef int            HI_S32;
+typedef void           HI_VOID;
+typedef HI_U32         HI_HANDLE;
+
+#define HI_SUCCESS      0
+#define HI_UNF_DISPLAY1 1
+#define HI_DRV_DISPLAY_1 1
+#define HI_UNF_VO_DEV_MODE_NORMAL 0
+
+#define HISI_TDE_COLOR_FMT_YCBCR420MBP 6
+#define HISI_TDE_COLOR_FMT_BGR888      7
+
+
+/*
+ * HI_UNF_VIDEO_FRAME_INFO_S - layout used by the 3798 DISP snapshot path.
+ * Allocated on heap (4096 bytes) because some SDK builds write beyond the
+ * public struct size.
+ */
+typedef struct {
+	HI_U32  u32Unk0;        /* 0x00 */
+	HI_U32  u32YPhyAddr;    /* 0x04 - luma physical address */
+	HI_U32  u32CPhyAddr;    /* 0x08 - chroma physical address */
+	HI_U32  u32Unk0c;       /* 0x0c */
+	HI_U32  u32YStride;     /* 0x10 - luma stride */
+	HI_U32  u32CStride;     /* 0x14 - chroma stride */
+	HI_U32  u32Pad1[7];     /* 0x18 - 0x30 */
+	HI_U32  u32Width;       /* 0x34 - frame width in pixels */
+	HI_U32  u32Height;      /* 0x38 - frame height in pixels */
+	HI_U32  u32Pad2[7];     /* 0x3c - 0x53 */
+	HI_U32  u32PixelFormat; /* 0x54 - 1 = NV21 (YUV420 semi-planar) */
+	HI_U32  u32Pad3[64];    /* remaining fields / SDK-private tail */
+} HI_UNF_VIDEO_FRAME_INFO_S;
+
+/* 3716mv410/mv430: UNF capture struct fields consumed by the vendor grab binary. */
+typedef struct {
+	HI_U32  u32Unk0;        /* 0x00 */
+	HI_U32  u32YPhyAddr;    /* 0x04 */
+	HI_U32  u32CPhyAddr;    /* 0x08 */
+	HI_U32  u32Unk0c;       /* 0x0c */
+	HI_U32  u32YStride;     /* 0x10 */
+	HI_U32  u32CStride;     /* 0x14 */
+	HI_U32  u32Pad1[7];     /* 0x18 - 0x30 */
+	HI_U32  u32Width;       /* 0x34 */
+	HI_U32  u32Height;      /* 0x38 */
+	HI_U32  u32Pad2[128];   /* SDK-private tail */
+} HI_UNF_3716_CAPTURE_INFO_S;
+
+/*
+ * 3716mv410/mv430 WIN_GET_HANDLE_S as used by the vendor grab source:
+ *   enDisp = HI_DRV_DISPLAY_1;
+ *   HI_MPI_WIN_GetHandle(&winInfo);
+ *   hWin = winInfo.ahWinHandle[0] when u32WinNumber > 0.
+ */
+typedef struct {
+	HI_U32    enDisp;          /* 0x00: HI_DRV_DISPLAY_1 */
+	HI_U32    u32WinNumber;    /* 0x04: number of handles returned */
+	HI_HANDLE ahWinHandle[16]; /* 0x08: first usable window handle */
+} WIN_GET_HANDLE_S;
+
+/* Minimal TDE structures matching the old grab call frames. */
+typedef struct {
+	HI_S32 s32Xpos;
+	HI_S32 s32Ypos;
+	HI_U32 u32Width;
+	HI_U32 u32Height;
+} HI_TDE2_RECT_S;
+
+typedef struct {
+	HI_U32 enColorFmt;       /* 6 = YCbCr420 macroblock picture */
+	HI_U32 u32YPhyAddr;
+	HI_U32 u32Width;
+	HI_U32 u32Height;
+	HI_U32 u32YStride;
+	HI_U32 u32CbCrPhyAddr;
+	HI_U32 u32CbCrStride;
+} HI_TDE2_MB_S;
+
+typedef struct {
+	HI_U32 u32PhyAddr;
+	HI_U32 enColorFmt;       /* 7 = RGB888 in the old grab binary */
+	HI_U32 u32Height;
+	HI_U32 u32Width;
+	HI_U32 u32Stride;
+	HI_U32 u32AlphaPhyAddr;
+	HI_U32 u32ClutPhyAddr;
+	HI_U32 bAlphaMax255;
+	HI_U32 bAlphaExt1555;
+	HI_U8  bYCbCrClut;
+	HI_U8  u8Alpha0;
+	HI_U8  u8Alpha1;
+	HI_U8  u8Reserved;
+	HI_U32 u32Reserved[2];
+} HI_TDE2_SURFACE_S;
+
+typedef struct {
+	HI_U32 u32Word[9];       /* old grab sets word[5]=1, word[6]=3 */
+} HI_TDE2_MBOPT_S;
+
+/* Function pointer types for dynamically loaded HiSi symbols */
+typedef HI_S32 (*PFN_HI_SYS_Init)(HI_VOID);
+typedef HI_S32 (*PFN_HI_SYS_DeInit)(HI_VOID);
+typedef HI_S32 (*PFN_HI_UNF_DISP_Init)(HI_VOID);
+typedef HI_S32 (*PFN_HI_UNF_DISP_DeInit)(HI_VOID);
+typedef HI_S32 (*PFN_HI_UNF_DISP_Open)(HI_U32 enDisp);
+typedef HI_S32 (*PFN_HI_UNF_DISP_AcquireSnapshot)(HI_U32 enDisp, HI_UNF_VIDEO_FRAME_INFO_S *pstSnapShot);
+typedef HI_S32 (*PFN_HI_UNF_DISP_ReleaseSnapshot)(HI_U32 enDisp, const HI_UNF_VIDEO_FRAME_INFO_S *pstSnapShot);
+typedef HI_S32 (*PFN_HI_UNF_VO_Init)(HI_U32 enDevMode);
+typedef HI_S32 (*PFN_HI_UNF_VO_DeInit)(HI_VOID);
+typedef HI_S32 (*PFN_HI_UNF_VO_CapturePicture)(HI_HANDLE hWin, HI_UNF_3716_CAPTURE_INFO_S *pstCapPicture);
+typedef HI_S32 (*PFN_HI_UNF_VO_CapturePictureRelease)(HI_HANDLE hWin, const HI_UNF_3716_CAPTURE_INFO_S *pstCapPicture);
+typedef HI_S32 (*PFN_HI_MPI_WIN_GetHandle)(WIN_GET_HANDLE_S *pstWinHandle);
+typedef HI_U32 (*PFN_HI_MMZ_New)(HI_U32 u32Size, HI_U32 u32Align, HI_VOID *pszZoneName, const char *pszMmbName);
+typedef HI_S32 (*PFN_HI_MMZ_Delete)(HI_U32 u32PhyAddr);
+typedef void*  (*PFN_HI_MMZ_Map)(HI_U32 u32PhyAddr, HI_U32 u32Cached);
+typedef HI_S32 (*PFN_HI_MMZ_Unmap)(HI_U32 u32PhyAddr);
+typedef HI_S32 (*PFN_HI_TDE2_Open)(HI_VOID);
+typedef HI_S32 (*PFN_HI_TDE2_Close)(HI_VOID);
+typedef HI_S32 (*PFN_HI_TDE2_BeginJob)(HI_VOID);
+typedef HI_S32 (*PFN_HI_TDE2_EndJob)(HI_S32 s32Handle, HI_U32 bSync, HI_U32 bBlock, HI_U32 u32TimeOut);
+typedef HI_S32 (*PFN_HI_TDE2_MbBlit)(HI_S32 s32Handle, const HI_TDE2_MB_S *pstMB, const HI_TDE2_RECT_S *pstMBRect,
+							 const HI_TDE2_SURFACE_S *pstDst, const HI_TDE2_RECT_S *pstDstRect, const HI_TDE2_MBOPT_S *pstOpt);
+
+static void hisi_preload_one(const char *name)
+{
+	void *h;
+	if (!name || !*name)
+		return;
+	h = dlopen(name, RTLD_LAZY | RTLD_GLOBAL);
+	(void)h;
+}
+
+static void hisi_preload_runtime_libs(void)
+{
+	/* libhi_msp on 3716mv410/mv430 may depend on the JPEG/HIGO stack when loaded directly. */
+	static const char *libs[] = {
+		"libjpeg.so", "libjpeg.so.8", "libjpeg.so.62", "libjpeg9b.so",
+		"/usr/lib/libjpeg.so", "/usr/lib/libjpeg.so.8", "/usr/lib/libjpeg.so.62", "/usr/lib/libjpeg9b.so",
+		"libz.so.1", "libpng16.so.16", "libatomic.so.1",
+		"/usr/lib/libhi_securec.so", "/usr/lib/libhigo.so", "/usr/lib/libhigoadp.so",
+		"/usr/lib/libhi_so.so", "/usr/lib/libhi_ttx.so", "/usr/lib/libhi_cc.so",
+		"/usr/lib/libhi_subtitle.so",
+		NULL
+	};
+	int i;
+	for (i = 0; libs[i]; i++)
+		hisi_preload_one(libs[i]);
+}
+
+static void *hisi_sym(void *preferred, void *fallback, const char *name)
+{
+	void *p = NULL;
+	if (preferred)
+		p = dlsym(preferred, name);
+	if (!p && fallback)
+		p = dlsym(fallback, name);
+	return p;
+}
+
+/*
+ * Some 3798 images ship /usr/lib/libhi_msp.so with PT_GNU_STACK marked
+ * executable (RWE).  Loading that library through dlopen() can fail on the
+ * running OpenATV kernel with:
+ *   cannot enable executable stack as shared object requires: Invalid argument
+ * The vendor grab has libhi_msp.so in DT_NEEDED and therefore does not hit the
+ * late-dlopen path.  For aio-grab keep the generic dlopen design, but if this
+ * exact failure happens, create a private /tmp copy of libhi_msp.so and clear
+ * PF_X from its PT_GNU_STACK header before dlopen().  No code segment is
+ * changed; only the stack permission request in the ELF program header is
+ * relaxed.
+ */
+static int hisi_copy_file(int in, int out)
+{
+	char buf[16384];
+	ssize_t rd;
+	while ((rd = read(in, buf, sizeof(buf))) > 0) {
+		char *p = buf;
+		ssize_t left = rd;
+		while (left > 0) {
+			ssize_t wr = write(out, p, (size_t)left);
+			if (wr <= 0)
+				return -1;
+			p += wr;
+			left -= wr;
+		}
+	}
+	return rd == 0 ? 0 : -1;
+}
+
+static int hisi_clear_elf32_execstack(const char *path)
+{
+	int fd = -1;
+	Elf32_Ehdr eh;
+	int i;
+
+	fd = open(path, O_RDWR);
+	if (fd < 0)
+		return -1;
+
+	if (read(fd, &eh, sizeof(eh)) != (ssize_t)sizeof(eh)) {
+		close(fd);
+		return -1;
+	}
+
+	if (memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 ||
+		eh.e_ident[EI_CLASS] != ELFCLASS32 ||
+		eh.e_ident[EI_DATA] != ELFDATA2LSB ||
+		eh.e_phoff == 0 || eh.e_phentsize != sizeof(Elf32_Phdr) || eh.e_phnum == 0) {
+		close(fd);
+		return -1;
+	}
+
+	for (i = 0; i < eh.e_phnum; i++) {
+		Elf32_Phdr ph;
+		off_t off = (off_t)eh.e_phoff + (off_t)i * (off_t)eh.e_phentsize;
+		if (lseek(fd, off, SEEK_SET) < 0 || read(fd, &ph, sizeof(ph)) != (ssize_t)sizeof(ph)) {
+			close(fd);
+			return -1;
+		}
+		if (ph.p_type == PT_GNU_STACK) {
+			if (ph.p_flags & PF_X) {
+				ph.p_flags &= ~PF_X;
+				if (lseek(fd, off, SEEK_SET) < 0 || write(fd, &ph, sizeof(ph)) != (ssize_t)sizeof(ph)) {
+					close(fd);
+					return -1;
+				}
+			}
+			close(fd);
+			return 0;
+		}
+	}
+
+	close(fd);
+	return -1;
+}
+
+static int hisi_make_noexecstack_copy(const char *src, char *dst, size_t dst_len)
+{
+	int in = -1, out = -1;
+	mode_t old_umask;
+
+	if (!src || !dst || dst_len < 32 || src[0] != '/')
+		return -1;
+
+	snprintf(dst, dst_len, "/tmp/aio-grab-libhi_msp-nx-%ld.so", (long)getpid());
+
+	in = open(src, O_RDONLY);
+	if (in < 0)
+		return -1;
+
+	old_umask = umask(022);
+	out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+	umask(old_umask);
+	if (out < 0) {
+		close(in);
+		return -1;
+	}
+
+	if (hisi_copy_file(in, out) < 0) {
+		close(in);
+		close(out);
+		unlink(dst);
+		return -1;
+	}
+	close(in);
+	if (close(out) < 0) {
+		unlink(dst);
+		return -1;
+	}
+
+	if (hisi_clear_elf32_execstack(dst) < 0) {
+		unlink(dst);
+		return -1;
+	}
+
+	return 0;
+}
+
+static void *hisi_dlopen_msp_with_execstack_fallback(const char *path)
+{
+	void *h;
+	const char *err;
+	char nx_path[256];
+
+	if (!path || !*path)
+		return NULL;
+
+	h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+	if (h)
+		return h;
+
+	err = dlerror();
+	if (!err)
+		return NULL;
+
+	if (strstr(err, "executable stack") == NULL &&
+		strstr(err, "cannot enable executable") == NULL) {
+		return NULL;
+	}
+
+	if (!quiet)
+		fprintf(stderr, "getvideo_hisi: %s needs executable stack, trying private noexecstack copy\n", path);
+
+	if (hisi_make_noexecstack_copy(path, nx_path, sizeof(nx_path)) < 0) {
+		if (!quiet)
+			fprintf(stderr, "getvideo_hisi: could not create noexecstack copy of %s: %s\n", path, strerror(errno));
+		return NULL;
+	}
+
+	h = dlopen(nx_path, RTLD_NOW | RTLD_GLOBAL);
+	if (!h) {
+		if (!quiet)
+			fprintf(stderr, "getvideo_hisi: dlopen noexecstack copy failed: %s\n", dlerror());
+		unlink(nx_path);
+		return NULL;
+	}
+
+	unlink(nx_path);
+
+	return h;
+}
+
+static int hisi_uses_chip_backend(void)
+{
+	switch (stb_type) {
+	case HISI_3716MV410:
+	case HISI_3716MV430:
+	case HISI_3798CV200:
+	case HISI_3798MV200:
+	case HISI_3798MV300:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+static int hisi_uses_composited_snapshot(void)
+{
+	return stb_type == HISI_3798MV200 || stb_type == HISI_3798MV300;
+}
+
+static int hisi_get_fb_size(int *w, int *h)
+{
+	int fd;
+	struct fb_var_screeninfo var;
+	if (!w || !h)
+		return -1;
+	*w = 0;
+	*h = 0;
+	fd = open("/dev/fb0", O_RDONLY);
+	if (fd < 0)
+		fd = open("/dev/fb/0", O_RDONLY);
+	if (fd < 0)
+		return -1;
+	memset(&var, 0, sizeof(var));
+	if (ioctl(fd, FBIOGET_VSCREENINFO, &var) < 0) {
+		close(fd);
+		return -1;
+	}
+	close(fd);
+	if (!var.xres || !var.yres)
+		return -1;
+	*w = (int)var.xres;
+	*h = (int)var.yres;
+	return 0;
+}
+
+static int hisi_open_libs(void)
+{
+	if (hisi_lib_common && hisi_lib_msp)
+		return 0;
+
+	hisi_preload_runtime_libs();
+
+	hisi_lib_common = dlopen("/usr/lib/libhi_common.so", RTLD_NOW | RTLD_GLOBAL);
+	if (!hisi_lib_common) {
+		fprintf(stderr, "getvideo_hisi: dlopen libhi_common.so failed: %s\n", dlerror());
+		return -1;
+	}
+
+	hisi_lib_msp = hisi_dlopen_msp_with_execstack_fallback("/usr/lib/libhi_msp.so");
+	if (!hisi_lib_msp)
+		hisi_lib_msp = dlopen("libhi_msp.so", RTLD_NOW | RTLD_GLOBAL);
+	if (!hisi_lib_msp) {
+		fprintf(stderr, "getvideo_hisi: dlopen libhi_msp.so failed: %s\n", dlerror());
+		return -1;
+	}
+	return 0;
+}
+
+static void getvideo_hisi_snapshot(unsigned char *video, int *xres, int *yres)
+{
+	HI_S32 ret;
+	HI_U32 display = HI_UNF_DISPLAY1;
+
+	*xres = 0;
+	*yres = 0;
+
+	if (hisi_open_libs() < 0)
+		return;
+
+	/* Resolve symbols */
+	PFN_HI_SYS_Init              pfnSysInit    = (PFN_HI_SYS_Init)dlsym(hisi_lib_common, "HI_SYS_Init");
+	PFN_HI_SYS_DeInit            pfnSysDeInit  = (PFN_HI_SYS_DeInit)dlsym(hisi_lib_common, "HI_SYS_DeInit");
+	PFN_HI_UNF_DISP_Init         pfnDispInit   = (PFN_HI_UNF_DISP_Init)dlsym(hisi_lib_msp,    "HI_UNF_DISP_Init");
+	PFN_HI_UNF_DISP_Open         pfnDispOpen   = (PFN_HI_UNF_DISP_Open)dlsym(hisi_lib_msp,    "HI_UNF_DISP_Open");
+	PFN_HI_UNF_DISP_AcquireSnapshot pfnAcquire = (PFN_HI_UNF_DISP_AcquireSnapshot)dlsym(hisi_lib_msp,    "HI_UNF_DISP_AcquireSnapshot");
+	PFN_HI_UNF_DISP_ReleaseSnapshot pfnRelease = (PFN_HI_UNF_DISP_ReleaseSnapshot)dlsym(hisi_lib_msp,    "HI_UNF_DISP_ReleaseSnapshot");
+	PFN_HI_MMZ_Map               pfnMMZMap     = (PFN_HI_MMZ_Map)hisi_sym(hisi_lib_common, hisi_lib_msp, "HI_MMZ_Map");
+	PFN_HI_MMZ_Unmap             pfnMMZUnmap   = (PFN_HI_MMZ_Unmap)hisi_sym(hisi_lib_common, hisi_lib_msp, "HI_MMZ_Unmap");
+
+	if (!pfnSysInit || !pfnDispInit || !pfnDispOpen ||
+		!pfnAcquire || !pfnRelease || !pfnMMZMap || !pfnMMZUnmap) {
+		fprintf(stderr, "getvideo_hisi: dlsym failed for 3798 snapshot functions\n");
+		return;
+	}
+
+	ret = pfnSysInit();
+	if (ret != HI_SUCCESS) {
+		fprintf(stderr, "getvideo_hisi: HI_SYS_Init failed: 0x%x\n", ret);
+		return;
+	}
+
+	ret = pfnDispInit();
+	if (ret != HI_SUCCESS) {
+		fprintf(stderr, "getvideo_hisi: HI_UNF_DISP_Init failed: 0x%x\n", ret);
+		goto cleanup_sys;
+	}
+
+	ret = pfnDispOpen(display);
+	if (ret != HI_SUCCESS) {
+		if (!quiet)
+			fprintf(stderr, "getvideo_hisi: HI_UNF_DISP_Open display=%u failed: 0x%x (ignoring)\n", display, ret);
+	}
+
+	HI_UNF_VIDEO_FRAME_INFO_S *pFrame = (HI_UNF_VIDEO_FRAME_INFO_S*)calloc(1, 4096);
+	if (!pFrame) {
+		fprintf(stderr, "getvideo_hisi: calloc failed\n");
+		goto cleanup_sys;
+	}
+
+	ret = pfnAcquire(display, pFrame);
+	if (ret != HI_SUCCESS) {
+		fprintf(stderr, "getvideo_hisi: HI_UNF_DISP_AcquireSnapshot display=%u failed: 0x%x\n", display, ret);
+		free(pFrame);
+		goto cleanup_sys;
+	}
+
+	if (!pFrame->u32Width || !pFrame->u32Height ||
+		!pFrame->u32YPhyAddr || !pFrame->u32CPhyAddr) {
+		fprintf(stderr, "getvideo_hisi: invalid frame info\n");
+		goto cleanup_snapshot;
+	}
+
+	unsigned char *y_virt  = (unsigned char*)pfnMMZMap(pFrame->u32YPhyAddr, 0);
+	if (!y_virt) {
+		fprintf(stderr, "getvideo_hisi: HI_MMZ_Map Y failed\n");
+		goto cleanup_snapshot;
+	}
+
+	int w       = (int)pFrame->u32Width;
+	int h       = (int)pFrame->u32Height;
+	int ystride = (int)pFrame->u32YStride;
+	int cstride = (int)pFrame->u32CStride;
+
+	/*
+	 * On some 3798 images the vendor grab calls HI_MMZ_Map only once with
+	 * u32YAddr.  u32CAddr is inside the same MMZ allocation and can be
+	 * non-page-aligned, so mapping u32CAddr separately may fail.
+	 * Keep the separate-map fallback for SDKs where Y and C are different MMBs.
+	 */
+	unsigned char *uv_virt = NULL;
+	int uv_mapped_separately = 0;
+	HI_U32 uv_offset = 0;
+	if (pFrame->u32CPhyAddr > pFrame->u32YPhyAddr) {
+		HI_U32 min_uv_offset = (HI_U32)ystride * (HI_U32)h;
+		uv_offset = pFrame->u32CPhyAddr - pFrame->u32YPhyAddr;
+		if (uv_offset >= min_uv_offset && uv_offset < (64U * 1024U * 1024U)) {
+			uv_virt = y_virt + uv_offset;
+			if (!quiet)
+				fprintf(stderr, "getvideo_hisi: using contiguous MMZ chroma offset 0x%x\n", uv_offset);
+		}
+	}
+
+	if (!uv_virt) {
+		uv_virt = (unsigned char*)pfnMMZMap(pFrame->u32CPhyAddr, 0);
+		uv_mapped_separately = 1;
+	}
+	if (!uv_virt) {
+		fprintf(stderr, "getvideo_hisi: HI_MMZ_Map UV failed y=0x%x c=0x%x\n",
+			pFrame->u32YPhyAddr, pFrame->u32CPhyAddr);
+		pfnMMZUnmap(pFrame->u32YPhyAddr);
+		goto cleanup_snapshot;
+	}
+
+	/* Convert NV21 (YUV420 semi-planar, V before U) to internal BGR. */
+	int i, j;
+	for (i = 0; i < h; i++) {
+		for (j = 0; j < w; j++) {
+			int y = y_virt[i * ystride + j];
+			int c0 = uv_virt[(i / 2) * cstride + (j & ~1)];
+			int c1 = uv_virt[(i / 2) * cstride + (j & ~1) + 1];
+			int v = c0;
+			int u = c1;
+
+			y -= 16;
+			u -= 128;
+			v -= 128;
+
+			int r = CLAMP((298 * y + 409 * v + 128) >> 8);
+			int g = CLAMP((298 * y - 100 * u - 208 * v + 128) >> 8);
+			int b = CLAMP((298 * y + 516 * u + 128) >> 8);
+
+			int off = (i * w + j) * 3;
+			video[off + 0] = (unsigned char)b;
+			video[off + 1] = (unsigned char)g;
+			video[off + 2] = (unsigned char)r;
+		}
+	}
+
+	*xres = w;
+	*yres = h;
+
+	if (uv_mapped_separately)
+		pfnMMZUnmap(pFrame->u32CPhyAddr);
+	pfnMMZUnmap(pFrame->u32YPhyAddr);
+
+cleanup_snapshot:
+	pfnRelease(display, pFrame);
+	free(pFrame);
+
+cleanup_sys:
+	if (pfnSysDeInit)
+		pfnSysDeInit();
+}
+
+
+/*
+ * 3716mv410 video backend.
+ *
+ * The old working mv410 grab binary does not use the mv430 WIN/VO/TDE path for
+ * "grab -v". Static analysis shows the video-only path executes:
+ *
+ *   rm -rf /home/capturevideo
+ *   mkdir /home/capturevideo
+ *   echo capture /home/capturevideo > /proc/msp/win0100
+ *
+ * Then it reads the created YUV420 planar dump from /home/capturevideo and
+ * parses width/height from the underscore-separated filename. Reimplement that
+ * path here and convert I420/YUV420p to aio-grab's internal BGR888 format.
+ */
+#define HISI_410_CAPTURE_DIR "/home/capturevideo"
+#define HISI_410_CAPTURE_CTL "/proc/msp/win0100"
+
+static int hisi_410_parse_dims_from_name(const char *name, off_t fsize, int *w, int *h)
+{
+	unsigned nums[16];
+	int n = 0;
+	const char *p = name;
+
+	*w = 0;
+	*h = 0;
+
+	while (*p && n < (int)(sizeof(nums) / sizeof(nums[0]))) {
+		while (*p && !isdigit((unsigned char)*p))
+			p++;
+		if (!*p)
+			break;
+		nums[n++] = (unsigned)strtoul(p, (char **)&p, 10);
+	}
+
+	for (int i = 0; i + 1 < n; i++) {
+		unsigned cw = nums[i];
+		unsigned ch = nums[i + 1];
+		if (cw < 320 || ch < 200 || cw > 3840 || ch > 2160)
+			continue;
+		if ((cw & 1) || (ch & 1))
+			continue;
+		if (fsize > 0 && (off_t)((cw * ch * 3U) / 2U) > fsize)
+			continue;
+		*w = (int)cw;
+		*h = (int)ch;
+		return 0;
+	}
+
+	/* Fallback for dumps where the filename does not carry dimensions. */
+	static const struct { int w, h; } known[] = {
+		{3840, 2160}, {1920, 1080}, {1280, 720}, {720, 576}, {720, 480}, {640, 480}
+	};
+	for (unsigned i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+		off_t need = (off_t)known[i].w * (off_t)known[i].h * 3 / 2;
+		if (need == fsize) {
+			*w = known[i].w;
+			*h = known[i].h;
+			return 0;
+		}
+	}
+
+	return -1;
+}
+
+static int hisi_410_find_capture_file(char *path, size_t path_len, int *w, int *h, off_t *need)
+{
+	DIR *dir;
+	struct dirent *de;
+	struct stat st;
+	char candidate[512];
+
+	if (!path || path_len == 0 || !w || !h || !need)
+		return -1;
+
+	path[0] = 0;
+	*w = 0;
+	*h = 0;
+	*need = 0;
+
+	dir = opendir(HISI_410_CAPTURE_DIR);
+	if (!dir)
+		return -1;
+
+	while ((de = readdir(dir)) != NULL) {
+		if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+			continue;
+		snprintf(candidate, sizeof(candidate), "%s/%s", HISI_410_CAPTURE_DIR, de->d_name);
+		if (stat(candidate, &st) < 0 || !S_ISREG(st.st_mode))
+			continue;
+		if (hisi_410_parse_dims_from_name(de->d_name, st.st_size, w, h) < 0)
+			continue;
+		*need = (off_t)(*w) * (off_t)(*h) * 3 / 2;
+		if (*need <= 0 || st.st_size < *need)
+			continue;
+		snprintf(path, path_len, "%s", candidate);
+		closedir(dir);
+		return 0;
+	}
+
+	closedir(dir);
+	return -1;
+}
+
+static int hisi_410_read_file(const char *path, unsigned char *buf, size_t len)
+{
+	FILE *fp = fopen(path, "rb");
+	if (!fp)
+		return -1;
+	size_t got = fread(buf, 1, len, fp);
+	fclose(fp);
+	return got == len ? 0 : -1;
+}
+
+static void hisi_410_i420_to_bgr(const unsigned char *yuv, unsigned char *bgr, int w, int h)
+{
+	const size_t y_size = (size_t)w * (size_t)h;
+	const size_t c_size = y_size / 4U;
+	const unsigned char *y_plane = yuv;
+	const unsigned char *u_plane = yuv + y_size;
+	const unsigned char *v_plane = yuv + y_size + c_size;
+
+	for (int yy = 0; yy < h; yy++) {
+		for (int xx = 0; xx < w; xx++) {
+			int y = y_plane[(size_t)yy * (size_t)w + (size_t)xx];
+			int u = u_plane[(size_t)(yy / 2) * (size_t)(w / 2) + (size_t)(xx / 2)];
+			int v = v_plane[(size_t)(yy / 2) * (size_t)(w / 2) + (size_t)(xx / 2)];
+
+			y -= 16;
+			u -= 128;
+			v -= 128;
+
+			int r = CLAMP((298 * y + 409 * v + 128) >> 8);
+			int g = CLAMP((298 * y - 100 * u - 208 * v + 128) >> 8);
+			int b = CLAMP((298 * y + 516 * u + 128) >> 8);
+
+			size_t off = ((size_t)yy * (size_t)w + (size_t)xx) * 3U;
+			bgr[off + 0] = (unsigned char)b;
+			bgr[off + 1] = (unsigned char)g;
+			bgr[off + 2] = (unsigned char)r;
+		}
+	}
+}
+
+static int getvideo_hisi_3716mv410_procfs(unsigned char *video, int *xres, int *yres)
+{
+	char capfile[512];
+	int w = 0, h = 0;
+	off_t need = 0;
+	unsigned char *yuv = NULL;
+	FILE *ctl;
+	int ret = -1;
+
+	*xres = 0;
+	*yres = 0;
+	capfile[0] = 0;
+
+	if (access(HISI_410_CAPTURE_CTL, W_OK) != 0) {
+		if (!quiet)
+			fprintf(stderr, "getvideo_hisi_3716mv410: %s not writable: %s\n", HISI_410_CAPTURE_CTL, strerror(errno));
+		return -1;
+	}
+
+	system("rm -rf " HISI_410_CAPTURE_DIR);
+	if (mkdir(HISI_410_CAPTURE_DIR, 0755) < 0 && errno != EEXIST) {
+		fprintf(stderr, "getvideo_hisi_3716mv410: mkdir %s failed: %s\n", HISI_410_CAPTURE_DIR, strerror(errno));
+		return -1;
+	}
+
+	ctl = fopen(HISI_410_CAPTURE_CTL, "w");
+	if (!ctl) {
+		fprintf(stderr, "getvideo_hisi_3716mv410: open %s failed: %s\n", HISI_410_CAPTURE_CTL, strerror(errno));
+		return -1;
+	}
+	fprintf(ctl, "capture %s\n", HISI_410_CAPTURE_DIR);
+	fclose(ctl);
+
+	/* The procfs capture is synchronous on the old grab, but give the driver a
+	 * short window so slower storage/filesystems do not race our directory scan. */
+	for (int tries = 0; tries < 20; tries++) {
+		if (hisi_410_find_capture_file(capfile, sizeof(capfile), &w, &h, &need) == 0)
+			break;
+		usleep(50000);
+	}
+
+	if (!w || !h || need <= 0 || !capfile[0]) {
+		fprintf(stderr, "getvideo_hisi_3716mv410: no usable capture file in %s\n", HISI_410_CAPTURE_DIR);
+		goto out;
+	}
+
+	yuv = (unsigned char *)malloc((size_t)need);
+	if (!yuv) {
+		fprintf(stderr, "getvideo_hisi_3716mv410: malloc failed size=%ld\n", (long)need);
+		goto out;
+	}
+
+	if (hisi_410_read_file(capfile, yuv, (size_t)need) < 0) {
+		fprintf(stderr, "getvideo_hisi_3716mv410: read %s failed\n", capfile);
+		goto out;
+	}
+
+	hisi_410_i420_to_bgr(yuv, video, w, h);
+	*xres = w;
+	*yres = h;
+	ret = 0;
+
+out:
+	free(yuv);
+	system("rm -rf " HISI_410_CAPTURE_DIR);
+	return ret;
+}
+
+static void getvideo_hisi_3716vo(unsigned char *video, int *xres, int *yres)
+{
+	HI_S32 ret;
+	HI_S32 job = -1;
+	HI_HANDLE hWin = 0;
+	HI_U32 dstPhys = 0;
+	unsigned char *dstVirt = NULL;
+	int tde_opened = 0;
+	int captured = 0;
+	int out_w = 0, out_h = 0;
+	int i;
+
+	*xres = 0;
+	*yres = 0;
+
+	if (hisi_open_libs() < 0)
+		return;
+
+	PFN_HI_SYS_Init    pfnSysInit    = (PFN_HI_SYS_Init)dlsym(hisi_lib_common, "HI_SYS_Init");
+	PFN_HI_SYS_DeInit  pfnSysDeInit  = (PFN_HI_SYS_DeInit)dlsym(hisi_lib_common, "HI_SYS_DeInit");
+	PFN_HI_UNF_DISP_Init   pfnDispInit   = (PFN_HI_UNF_DISP_Init)dlsym(hisi_lib_msp, "HI_UNF_DISP_Init");
+	PFN_HI_UNF_DISP_DeInit pfnDispDeInit = (PFN_HI_UNF_DISP_DeInit)dlsym(hisi_lib_msp, "HI_UNF_DISP_DeInit");
+	PFN_HI_UNF_VO_Init     pfnVoInit     = (PFN_HI_UNF_VO_Init)dlsym(hisi_lib_msp, "HI_UNF_VO_Init");
+	PFN_HI_UNF_VO_DeInit   pfnVoDeInit   = (PFN_HI_UNF_VO_DeInit)dlsym(hisi_lib_msp, "HI_UNF_VO_DeInit");
+	PFN_HI_MPI_WIN_GetHandle pfnGetHandle = (PFN_HI_MPI_WIN_GetHandle)dlsym(hisi_lib_msp, "HI_MPI_WIN_GetHandle");
+	PFN_HI_UNF_VO_CapturePicture pfnCapture = (PFN_HI_UNF_VO_CapturePicture)dlsym(hisi_lib_msp, "HI_UNF_VO_CapturePicture");
+	PFN_HI_UNF_VO_CapturePictureRelease pfnRelease = (PFN_HI_UNF_VO_CapturePictureRelease)dlsym(hisi_lib_msp, "HI_UNF_VO_CapturePictureRelease");
+	PFN_HI_MMZ_New    pfnMMZNew    = (PFN_HI_MMZ_New)hisi_sym(hisi_lib_common, hisi_lib_msp, "HI_MMZ_New");
+	PFN_HI_MMZ_Delete pfnMMZDelete = (PFN_HI_MMZ_Delete)hisi_sym(hisi_lib_common, hisi_lib_msp, "HI_MMZ_Delete");
+	PFN_HI_MMZ_Map    pfnMMZMap    = (PFN_HI_MMZ_Map)hisi_sym(hisi_lib_common, hisi_lib_msp, "HI_MMZ_Map");
+	PFN_HI_MMZ_Unmap  pfnMMZUnmap  = (PFN_HI_MMZ_Unmap)hisi_sym(hisi_lib_common, hisi_lib_msp, "HI_MMZ_Unmap");
+	PFN_HI_TDE2_Open     pfnTdeOpen     = (PFN_HI_TDE2_Open)dlsym(hisi_lib_msp, "HI_TDE2_Open");
+	PFN_HI_TDE2_Close    pfnTdeClose    = (PFN_HI_TDE2_Close)dlsym(hisi_lib_msp, "HI_TDE2_Close");
+	PFN_HI_TDE2_BeginJob pfnTdeBeginJob = (PFN_HI_TDE2_BeginJob)dlsym(hisi_lib_msp, "HI_TDE2_BeginJob");
+	PFN_HI_TDE2_EndJob   pfnTdeEndJob   = (PFN_HI_TDE2_EndJob)dlsym(hisi_lib_msp, "HI_TDE2_EndJob");
+	PFN_HI_TDE2_MbBlit   pfnTdeMbBlit   = (PFN_HI_TDE2_MbBlit)dlsym(hisi_lib_msp, "HI_TDE2_MbBlit");
+
+	if (!pfnSysInit || !pfnDispInit || !pfnVoInit || !pfnGetHandle ||
+		!pfnCapture || !pfnRelease || !pfnMMZNew || !pfnMMZDelete ||
+		!pfnMMZMap || !pfnMMZUnmap || !pfnTdeOpen || !pfnTdeClose ||
+		!pfnTdeBeginJob || !pfnTdeEndJob || !pfnTdeMbBlit) {
+		fprintf(stderr, "getvideo_hisi_3716vo: dlsym failed for VO/TDE functions\n");
+		return;
+	}
+
+	ret = pfnSysInit();
+	if (ret != HI_SUCCESS) {
+		fprintf(stderr, "getvideo_hisi_3716vo: HI_SYS_Init failed: 0x%x\n", ret);
+		return;
+	}
+
+	ret = pfnDispInit();
+	if (ret != HI_SUCCESS) {
+		fprintf(stderr, "getvideo_hisi_3716vo: HI_UNF_DISP_Init failed: 0x%x\n", ret);
+		goto cleanup_sys;
+	}
+
+	ret = pfnVoInit(HI_UNF_VO_DEV_MODE_NORMAL);
+	if (ret != HI_SUCCESS) {
+		fprintf(stderr, "getvideo_hisi_3716vo: HI_UNF_VO_Init failed: 0x%x\n", ret);
+		goto cleanup_disp;
+	}
+
+	WIN_GET_HANDLE_S winInfo;
+	memset(&winInfo, 0, sizeof(winInfo));
+	winInfo.enDisp = HI_DRV_DISPLAY_1;
+	ret = pfnGetHandle(&winInfo);
+	if (ret != HI_SUCCESS || winInfo.u32WinNumber == 0 || !winInfo.ahWinHandle[0]) {
+		fprintf(stderr, "getvideo_hisi_3716vo: HI_MPI_WIN_GetHandle failed: 0x%x winNumber=%u hWin0=0x%x\n",
+			ret, winInfo.u32WinNumber, winInfo.ahWinHandle[0]);
+		goto cleanup_vo;
+	}
+	hWin = winInfo.ahWinHandle[0];
+
+	HI_UNF_3716_CAPTURE_INFO_S *cap = (HI_UNF_3716_CAPTURE_INFO_S*)calloc(1, 4096);
+	if (!cap) {
+		fprintf(stderr, "getvideo_hisi_3716vo: calloc failed\n");
+		goto cleanup_vo;
+	}
+
+	ret = pfnCapture(hWin, cap);
+	if (ret != HI_SUCCESS) {
+		fprintf(stderr, "getvideo_hisi_3716vo: HI_UNF_VO_CapturePicture failed: 0x%x\n", ret);
+		free(cap);
+		goto cleanup_vo;
+	}
+	captured = 1;
+
+	/*
+	 * HI_UNF_VO_CapturePicture returns the public UNF layout used by the old
+	 * grab binary: Y=0x04, C=0x08, stride=0x10, size=0x34/0x38.
+	 * Some hooks see the internal MPI layout before the UNF wrapper copies it,
+	 * so keep a fallback for Y=0x0c, C=0x20, stride=0x18/0x30, size=0x11c.
+	 */
+	HI_U32 capYPhy    = cap->u32YPhyAddr;
+	HI_U32 capCPhy    = cap->u32CPhyAddr;
+	HI_U32 capYStride = cap->u32YStride;
+	HI_U32 capCStride = cap->u32CStride ? cap->u32CStride : cap->u32YStride;
+	HI_U32 capW       = cap->u32Width;
+	HI_U32 capH       = cap->u32Height;
+
+	if (!capYPhy || !capCPhy || !capYStride || !capW || !capH || capW > 3840 || capH > 2160) {
+		HI_U32 *raw = (HI_U32*)cap;
+		HI_U32 w2 = raw[0x11c / 4];
+		HI_U32 h2 = raw[0x120 / 4];
+		if (!w2 || !h2 || w2 > 3840 || h2 > 2160) {
+			w2 = raw[0x1a0 / 4];
+			h2 = raw[0x1a4 / 4];
+		}
+		if (raw[0x00c / 4] && raw[0x020 / 4] && raw[0x018 / 4] &&
+			w2 && h2 && w2 <= 3840 && h2 <= 2160) {
+			capYPhy    = raw[0x00c / 4];
+			capCPhy    = raw[0x020 / 4];
+			capYStride = raw[0x018 / 4];
+			capCStride = raw[0x030 / 4] ? raw[0x030 / 4] : raw[0x018 / 4];
+			capW       = w2;
+			capH       = h2;
+		}
+	}
+
+	if (!capYPhy || !capCPhy || !capYStride || !capW || !capH || capW > 3840 || capH > 2160) {
+		fprintf(stderr, "getvideo_hisi_3716vo: invalid capture info y=0x%x c=0x%x stride=%u/%u size=%ux%u\n",
+			capYPhy, capCPhy, capYStride, capCStride, capW, capH);
+		goto cleanup_capture;
+	}
+
+	if (hisi_get_fb_size(&out_w, &out_h) < 0 || out_w <= 0 || out_h <= 0) {
+		out_w = (int)capW;
+		out_h = (int)capH;
+	}
+
+	if (out_w <= 0 || out_h <= 0 || out_w > 1920 || out_h > 1080) {
+		fprintf(stderr, "getvideo_hisi_3716vo: refusing invalid output size %dx%d\n", out_w, out_h);
+		goto cleanup_capture;
+	}
+
+	int dstStride = out_w * 3;
+	HI_U32 dstSize = (HI_U32)(dstStride * out_h);
+	dstPhys = pfnMMZNew(dstSize, 0x40, NULL, "aio_grab_3716_rgb");
+	if (!dstPhys) {
+		fprintf(stderr, "getvideo_hisi_3716vo: HI_MMZ_New failed size=0x%x\n", dstSize);
+		goto cleanup_capture;
+	}
+
+	HI_TDE2_MB_S mb;
+	HI_TDE2_RECT_S mbRect;
+	HI_TDE2_SURFACE_S dst;
+	HI_TDE2_RECT_S dstRect;
+	HI_TDE2_MBOPT_S opt;
+	memset(&mb, 0, sizeof(mb));
+	memset(&mbRect, 0, sizeof(mbRect));
+	memset(&dst, 0, sizeof(dst));
+	memset(&dstRect, 0, sizeof(dstRect));
+	memset(&opt, 0, sizeof(opt));
+
+	mb.enColorFmt     = HISI_TDE_COLOR_FMT_YCBCR420MBP;
+	mb.u32YPhyAddr    = capYPhy;
+	mb.u32Width       = capW;
+	mb.u32Height      = capH;
+	mb.u32YStride     = capYStride;
+	mb.u32CbCrPhyAddr = capCPhy;
+	mb.u32CbCrStride  = capCStride ? capCStride : capYStride;
+
+	mbRect.s32Xpos    = 0;
+	mbRect.s32Ypos    = 0;
+	mbRect.u32Width   = capW;
+	mbRect.u32Height  = capH;
+
+	dst.u32PhyAddr    = dstPhys;
+	dst.enColorFmt    = HISI_TDE_COLOR_FMT_BGR888;
+	dst.u32Height     = (HI_U32)out_h;
+	dst.u32Width      = (HI_U32)out_w;
+	dst.u32Stride     = (HI_U32)dstStride;
+	dst.bAlphaMax255  = 1;
+	dst.bAlphaExt1555 = 1;
+	dst.bYCbCrClut    = 0;
+	dst.u8Alpha0      = 0xff;
+
+	dstRect.s32Xpos   = 0;
+	dstRect.s32Ypos   = 0;
+	dstRect.u32Width  = (HI_U32)out_w;
+	dstRect.u32Height = (HI_U32)out_h;
+
+	opt.u32Word[5] = 1;
+	opt.u32Word[6] = 3;
+
+	ret = pfnTdeOpen();
+	if (ret != HI_SUCCESS) {
+		fprintf(stderr, "getvideo_hisi_3716vo: HI_TDE2_Open failed: 0x%x\n", ret);
+		goto cleanup_capture;
+	}
+	tde_opened = 1;
+
+	job = pfnTdeBeginJob();
+	if (job < 0) {
+		fprintf(stderr, "getvideo_hisi_3716vo: HI_TDE2_BeginJob failed: 0x%x\n", job);
+		goto cleanup_capture;
+	}
+
+	ret = pfnTdeMbBlit(job, &mb, &mbRect, &dst, &dstRect, &opt);
+	if (ret != HI_SUCCESS) {
+		fprintf(stderr, "getvideo_hisi_3716vo: HI_TDE2_MbBlit failed: 0x%x\n", ret);
+		goto cleanup_capture;
+	}
+
+	ret = pfnTdeEndJob(job, 1, 1, 1000);
+	job = -1;
+	if (ret != HI_SUCCESS) {
+		fprintf(stderr, "getvideo_hisi_3716vo: HI_TDE2_EndJob failed: 0x%x\n", ret);
+		goto cleanup_capture;
+	}
+
+	dstVirt = (unsigned char*)pfnMMZMap(dstPhys, 0);
+	if (!dstVirt) {
+		fprintf(stderr, "getvideo_hisi_3716vo: HI_MMZ_Map dst failed\n");
+		goto cleanup_capture;
+	}
+
+	/* TDE destination is BGR888; aio-grab's JPEG path expects RGB order here. */
+	for (i = 0; i < out_w * out_h; i++) {
+		video[i * 3 + 0] = dstVirt[i * 3 + 2];
+		video[i * 3 + 1] = dstVirt[i * 3 + 1];
+		video[i * 3 + 2] = dstVirt[i * 3 + 0];
+	}
+
+	*xres = out_w;
+	*yres = out_h;
+
+cleanup_capture:
+	if (dstVirt)
+		pfnMMZUnmap(dstPhys);
+	if (tde_opened)
+		pfnTdeClose();
+	if (captured)
+		pfnRelease(hWin, cap);
+	if (dstPhys)
+		pfnMMZDelete(dstPhys);
+	free(cap);
+
+cleanup_vo:
+	if (pfnVoDeInit)
+		pfnVoDeInit();
+cleanup_disp:
+	if (pfnDispDeInit)
+		pfnDispDeInit();
+cleanup_sys:
+	if (pfnSysDeInit)
+		pfnSysDeInit();
+}
+
+void getvideo_hisi(unsigned char *video, int *xres, int *yres)
+{
+	switch (stb_type) {
+	case HISI_3716MV410:
+		if (getvideo_hisi_3716mv410_procfs(video, xres, yres) == 0)
+			return;
+		if (!quiet)
+			fprintf(stderr, "getvideo_hisi: 3716mv410 procfs capture failed, trying DISP snapshot fallback\n");
+		getvideo_hisi_snapshot(video, xres, yres);
+		return;
+
+	case HISI_3716MV430:
+		getvideo_hisi_3716vo(video, xres, yres);
+		return;
+
+	case HISI_3798MV200:
+	case HISI_3798MV300:
+		if (hisi_grab_request_video_only) {
+			if (!quiet)
+				fprintf(stderr, "HiSi 3798: using VO CapturePicture for real video-only\n");
+			getvideo_hisi_3716vo(video, xres, yres);
+			if (*xres > 0 && *yres > 0)
+				return;
+			if (!quiet)
+				fprintf(stderr, "HiSi 3798: VO CapturePicture failed, falling back to DISP snapshot; result may contain OSD\n");
+		}
+		getvideo_hisi_snapshot(video, xres, yres);
+		return;
+
+	case HISI_3798CV200:
+		getvideo_hisi_snapshot(video, xres, yres);
+		return;
+
+	default:
+		*xres = 0;
+		*yres = 0;
+		if (!quiet)
+			fprintf(stderr, "getvideo_hisi: unsupported HiSilicon stb_type=%d\n", stb_type);
+		return;
+	}
+}
+
+// grabing the video picture
+
+void getvideo2(unsigned char *video, int *xres, int *yres)
+{
+	char buf[256];
+	sprintf(buf, "/dev/dvb/adapter0/video%d", video_dev);
+	int fd_video = open(buf, O_RDONLY);
+	if (fd_video < 0) {
+		fprintf(stderr, "could not open %s\n", buf);
+		return;
+	}
+	ssize_t r = read(fd_video, video, 1920 * 1080 * 3);
+	close(fd_video);
+	*xres = 1920;
+	*yres = 1080;
+	return;
+}
+
+/* Copy physical memory through a cached /dev/mem mapping into a new buffer. */
+static unsigned char *grab_copy_phys(off_t phys, size_t len)
+{
+	off_t pageoffset = phys & 0xfff;
+	unsigned char *copy = NULL;
+	unsigned char *map;
+	int fd = open("/dev/mem", O_RDONLY);
+
+	if (fd < 0)
+		return NULL;
+	map = mmap(0, len + pageoffset, PROT_READ, MAP_SHARED, fd, phys - pageoffset);
+	if (map != MAP_FAILED)
+	{
+		copy = malloc(len);
+		if (copy)
+			memcpy(copy, map + pageoffset, len);
+		munmap(map, len + pageoffset);
+	}
+	close(fd);
+	return copy;
+}
+
+/* Keeps the reads of grab_evict_dcache() from being optimized away. */
+uint32_t grab_evict_sink;
+
+/* The decoder writes its pictures past the CPU caches.  Push out lines that
+ * a previous grab may have left behind for the same buffers by reading more
+ * memory than the L2 cache holds.  Reads are needed: large memsets stream
+ * past the cache without allocating lines. */
+static void grab_evict_dcache(void)
+{
+	const size_t count = 8 * 1024 * 1024 / sizeof(uint32_t);
+	uint32_t *buf = malloc(count * sizeof(uint32_t));
+	uint32_t sum = 0;
+
+	if (!buf)
+		return;
+	memset(buf, 1, count * sizeof(uint32_t));
+	for (size_t i = 0; i < count; i += 8)
+		sum += buf[i];
+	grab_evict_sink = sum;
+	free(buf);
+}
+
+/* Copy the luma and chroma planes the BRCM7439 video feeder currently shows.
+ * Uncached reads take about 0.5 s per UHD plane and the decoder reuses a
+ * buffer right after the display moved on, so copy through a cached mapping,
+ * read the addresses directly before copying and retry when the picture
+ * changed during the copy. */
+static int grab_brcm7439_copy_planes(int mem_fd, size_t luma_len, size_t chroma_len, unsigned char **luma_copy, unsigned char **chroma_copy)
+{
+	void *map = mmap(0, 0x1000, PROT_READ, MAP_SHARED, mem_fd, registeroffset);
+	const volatile uint32_t *regs;
+	unsigned char *luma_buf = NULL;
+	unsigned char *chroma_buf = NULL;
+
+	if (map == MAP_FAILED)
+		return -1;
+	regs = map;
+	grab_evict_dcache();
+	for (int attempt = 0; attempt < 4; attempt++)
+	{
+		uint32_t luma_adr = regs[0x34 / 4] & 0xffffff00;
+		uint32_t chroma_adr = regs[0x3c / 4] & 0xffffff00;
+		free(luma_buf);
+		free(chroma_buf);
+		luma_buf = grab_copy_phys(luma_adr, luma_len);
+		chroma_buf = grab_copy_phys(chroma_adr, chroma_len);
+		if (!luma_buf || !chroma_buf || (regs[0x34 / 4] & 0xffffff00) == luma_adr)
+			break;
+	}
+	munmap(map, 0x1000);
+	if (!luma_buf || !chroma_buf)
+	{
+		free(luma_buf);
+		free(chroma_buf);
+		return -1;
+	}
+	*luma_copy = luma_buf;
+	*chroma_copy = chroma_buf;
+	return 0;
+}
+
+/* 8-bit samples are stored byte swapped per 32-bit word. */
+static int grab_brcm7439_put8(const unsigned char *row, unsigned char *out, int x, int width)
+{
+	int n = width - x < 0x80 ? width - x : 0x80;
+
+	for (int i = 0; i < n; i++)
+		out[x + i] = row[i ^ 3];
+	return x + n;
+}
+
+/* 10-bit pictures pack three samples into each little-endian 32-bit word. */
+static int grab_brcm7439_put10(const unsigned char *row, unsigned char *out, int x, int width)
+{
+	const uint32_t *words = (const uint32_t *)row;
+	int n = width - x < 0x60 ? width - x : 0x60;
+
+	for (int i = 0; i < n; i++)
+		out[x + i] = (le32toh(words[i / 3]) >> (10 * (i % 3) + 2)) & 0xff;
+	return x + n;
+}
+
+/* Turn a BRCM7439 decoder plane into one 8-bit plane in display order.  The
+ * plane is stored in stripes 128 bytes wide and all lines high, and every
+ * second pair of lines swaps neighbouring 32-byte blocks. */
+static void grab_brcm7439_unstripe(const unsigned char *src, int row_bytes, int lines, int tenbit, unsigned char *dst, int width)
+{
+	int stripes = row_bytes / 0x80;
+
+	#pragma omp parallel for
+	for (int y = 0; y < lines; y++)
+	{
+		unsigned char *out = dst + (size_t)y * width;
+		int swap = (y & 2) ? 1 : 0;
+		int x = 0;
+		for (int s = 0; s < stripes; s++)
+		{
+			const unsigned char *line = src + ((size_t)s * lines + y) * 0x80;
+			unsigned char row[0x80] __attribute__((aligned(4)));
+			for (int b = 0; b < 4; b++)
+				memcpy(row + b * 0x20, line + (b ^ swap) * 0x20, 0x20);
+			x = tenbit ? grab_brcm7439_put10(row, out, x, width) : grab_brcm7439_put8(row, out, x, width);
+		}
+	}
+}
+
+void getvideo(unsigned char *video, int *xres, int *yres)
+{
+	int mem_fd;
+	//unsigned char *memory;
+	void *memory;
+	unsigned char *luma = NULL;
+	unsigned char *chroma = NULL;
+	unsigned char *memory_tmp = NULL;
+	int t;
+	int res = 0;
+	int stride = 0;
+	FILE *fp;
+	char buf[256];
+
+	if ((mem_fd = open("/dev/mem", O_RDWR|O_SYNC) ) < 0)
+	{
+		fprintf(stderr, "Mainmemory: can't open /dev/mem \n");
+		return;
+	}
+
+	if (stb_type > XILLEON)
+	{
+		// grab bcm pic from decoder memory
+		const unsigned char* data = (unsigned char*)mmap(0, 100, PROT_READ, MAP_SHARED, mem_fd, registeroffset);
+		if(data == MAP_FAILED)
+		{
+			fprintf(stderr, "Mainmemory: <Memmapping failed 1>\n");
+			return;
+		}
+
+		off_t adr, adr2, ofs, ofs2, offset, pageoffset;
+		int xtmp,xsub,ytmp,t2,dat1;
+		int tenbit = 0;
+
+/* The unsigned int(0) is present in some lines here to ensure that the
+ * "item << 24" doesn't result in sign extension if item has the top-bit
+ * set and we are using the 64-bit file-system API.
+ */
+		if (stb_type == BRCM73565 || stb_type == BRCM73625 || stb_type == BRCM7439DAGS || stb_type == BRCM7439 || stb_type == BRCM75845 || stb_type == BRCM72604) {
+			chr_luma_register_offset = 0x3c;
+
+			ofs = data[chr_luma_register_offset + 24] << 4; /* luma lines */
+			ofs2 = data[chr_luma_register_offset + 28] << 4; /* chroma lines */
+			adr2 = (unsigned int)0 | data[chr_luma_register_offset + 3] << 24 | data[chr_luma_register_offset + 2] << 16 | data[chr_luma_register_offset + 1] << 8;
+			stride = data[0x19] << 8 | data[0x18];
+			adr = (unsigned int)0 | data[0x37] << 24 | data[0x36] << 16 | data[0x35] << 8; /* start of videomem */
+			tenbit = stb_type == BRCM7439 && data[0x20] == 3;
+		} else {
+			ofs = data[chr_luma_register_offset + 8] << 4; /* luma lines */
+			ofs2 = data[chr_luma_register_offset + 12] << 4; /* chroma lines */
+			adr2 = (unsigned int)0 | data[chr_luma_register_offset + 3] << 24 | data[chr_luma_register_offset + 2] << 16 | data[chr_luma_register_offset + 1] << 8;
+			stride = data[0x15] << 8 | data[0x14];
+			adr = (unsigned int)0 | data[0x1f] << 24 | data[0x1e] << 16 | data[0x1d] << 8; /* start of videomem */
+		}
+		offset = adr2 - adr;
+		pageoffset = adr & 0xfff;
+		adr -= pageoffset;
+		adr2 -= pageoffset;
+
+		munmap((void*)data, 100);
+
+		fp=fopen("/proc/stb/vmpeg/0/yres","r");
+		while (fgets(buf,sizeof(buf),fp))
+			sscanf(buf,"%x",&res);
+		fclose(fp);
+
+		if (!adr || !adr2)
+		{
+			*xres = stride;
+			*yres = res;
+			memset(video, 0, *xres * *yres * 3);
+			return;
+		}
+
+		//fprintf(stderr, "Stride: %d Res: %d\n",stride,res);
+		//fprintf(stderr, "Adr: %X Adr2: %X OFS: %d %d\n",adr,adr2,ofs,ofs2);
+
+		luma = (unsigned char *)malloc(stride*(ofs));
+		chroma = (unsigned char *)malloc(stride * ofs2);
+
+		int memory_tmp_size = 0;
+		// grabbing luma & chroma plane from the decoder memory
+		if (!mem2memdma_register && stb_type == BRCM7439)
+		{
+			/* UHD pictures keep luma and chroma on different memory controllers,
+			 * so copy both planes separately instead of one span from luma. */
+			int row_bytes = ((tenbit ? (stride + 2) / 3 * 4 : stride) + 0x7f) & ~0x7f;
+			unsigned char *chroma_copy;
+			if (grab_brcm7439_copy_planes(mem_fd, (size_t)row_bytes * ofs, (size_t)row_bytes * ofs2, &memory_tmp, &chroma_copy) < 0)
+			{
+				fprintf(stderr, "Mainmemory: <Memmapping failed 2>\n");
+				return;
+			}
+			grab_brcm7439_unstripe(memory_tmp, row_bytes, ofs, tenbit, luma, stride);
+			grab_brcm7439_unstripe(chroma_copy, row_bytes, ofs2, tenbit, chroma, stride);
+			free(memory_tmp);
+			free(chroma_copy);
+			goto planes_ready;
+		}
+		else if (!mem2memdma_register)
+		{
+			// we have direct access to the decoder memory
+			memory_tmp_size = offset + (stride + chr_luma_stride) * ofs2;
+			if((memory_tmp = (unsigned char*)mmap(0, memory_tmp_size, PROT_READ, MAP_SHARED, mem_fd, adr)) == MAP_FAILED)
+			{
+				fprintf(stderr, "Mainmemory: <Memmapping failed 2>\n");
+				return;
+			}
+
+			usleep(50000); 	// we try to get a full picture, its not possible to get a sync from the decoder so we use a delay
+							// and hope we get a good timing. dont ask me why, but every DM800 i tested so far produced a good
+							// result with a 50ms delay
+
+		}
+		else
+		{
+			int tmp_size = offset + (stride + chr_luma_stride) * ofs2;
+			if (tmp_size > 2 * DMA_BLOCKSIZE)
+			{
+				fprintf(stderr, "Got invalid stride value from the decoder: %d\n", stride);
+				return;
+			}
+			memory_tmp_size = DMA_BLOCKSIZE + 0x1000;
+			if ((memory_tmp = (unsigned char*)mmap(0, memory_tmp_size, PROT_READ|PROT_WRITE, MAP_SHARED, mem_fd, SPARE_RAM)) == MAP_FAILED)
+			{
+				fprintf(stderr, "Mainmemory: <Memmapping failed 3>\n");
+				return;
+			}
+			volatile unsigned long *mem_dma;
+			if ((mem_dma = (volatile unsigned long*)mmap(0, 0x1000, PROT_READ|PROT_WRITE, MAP_SHARED, mem_fd, mem2memdma_register)) == MAP_FAILED)
+			{
+				fprintf(stderr, "Mainmemory: <Memmapping failed 4>\n");
+				return;
+			}
+
+			int i = 0;
+			int tmp_len = DMA_BLOCKSIZE;
+			for (i=0; i < tmp_size; i += DMA_BLOCKSIZE)
+			{
+
+				unsigned long *descriptor = (void*)memory_tmp;
+
+				if (i + DMA_BLOCKSIZE > tmp_size)
+					tmp_len = tmp_size - i;
+
+				//fprintf(stderr, "DMACopy: %x (%d) size: %d\n", adr+i, i, tmp_len);
+
+				descriptor[0] = /* READ */ adr + i;
+				descriptor[1] = /* WRITE */ SPARE_RAM + 0x1000;
+				descriptor[2] = 0x40000000 | /* LEN */ tmp_len;
+				descriptor[3] = 0;
+				descriptor[4] = 0;
+				descriptor[5] = 0;
+				descriptor[6] = 0;
+				descriptor[7] = 0;
+				mem_dma[1] = /* FIRST_DESCRIPTOR */ SPARE_RAM;
+				mem_dma[3] = /* DMA WAKE CTRL */ 3;
+				mem_dma[2] = 1;
+				while (mem_dma[5] == 1)
+					usleep(2);
+				mem_dma[2] = 0;
+
+			}
+
+			munmap((void *)mem_dma, 0x1000);
+			/* unmap the dma descriptor page, we won't need it anymore */
+			munmap((void *)memory_tmp, 0x1000);
+			/* adjust start and size of the remaining memory_tmp mmap */
+			memory_tmp += 0x1000;
+			memory_tmp_size -= 0x1000;
+		}
+
+		t=t2=dat1=0;
+
+		xsub=chr_luma_stride;
+		// decode luma & chroma plane or lets say sort it
+		for (xtmp=0; xtmp < stride; xtmp += chr_luma_stride)
+		{
+			if ((stride-xtmp) <= chr_luma_stride)
+				xsub=stride-xtmp;
+
+			dat1=xtmp;
+			for (ytmp = 0; ytmp < ofs; ytmp++)
+			{
+				if (stb_type == BRCM7439)
+				{
+					if (t & 0x100)
+					{
+						int cp = xsub % 0x20 ?: 0x20; // cp = xsub % 0x20 ? xsub % 0x20 : 0x20;
+						switch (xsub)
+						{
+							case 0x61 ... 0x80:
+								memcpy(luma + dat1 + 0x60, memory_tmp+pageoffset + t + 0x40, cp);
+								cp = 0x20;
+							case 0x41 ... 0x60:
+								memcpy(luma + dat1 + 0x40, memory_tmp+pageoffset + t + 0x60, cp);
+								cp = 0x20;
+							case 0x21 ... 0x40:
+								memcpy(luma + dat1 + 0x20, memory_tmp+pageoffset + t + 0x00, cp);
+								cp = 0x20;
+							default:
+								memcpy(luma + dat1 + 0x00, memory_tmp+pageoffset + t + 0x20, cp);
+						}
+					}
+					else
+					{
+						memcpy(luma+dat1,memory_tmp+pageoffset+t,xsub); // luma
+					}
+				}
+				else if (stb_type == BRCM7439DAGS)
+				{
+					if (t & 0x200)
+					{
+						int cp = xsub % 0x20 ?: 0x20; // cp = xsub % 0x20 ? xsub % 0x20 : 0x20;
+						switch (xsub)
+						{
+							case 0xe1 ... 0x100:
+								memcpy(luma + dat1 + 0xe0, memory_tmp+pageoffset + t + 0xc0, cp);
+								cp = 0x20;
+							case 0xc1 ... 0xe0:
+								memcpy(luma + dat1 + 0xc0, memory_tmp+pageoffset + t + 0xe0, cp);
+								cp = 0x20;
+							case 0xa1 ... 0xc0:
+								memcpy(luma + dat1 + 0xa0, memory_tmp+pageoffset + t + 0x80, cp);
+								cp = 0x20;
+							case 0x81 ... 0xa0:
+								memcpy(luma + dat1 + 0x80, memory_tmp+pageoffset + t + 0xa0, cp);
+								cp = 0x20;
+							case 0x61 ... 0x80:
+								memcpy(luma + dat1 + 0x60, memory_tmp+pageoffset + t + 0x40, cp);
+								cp = 0x20;
+							case 0x41 ... 0x60:
+								memcpy(luma + dat1 + 0x40, memory_tmp+pageoffset + t + 0x60, cp);
+								cp = 0x20;
+							case 0x21 ... 0x40:
+								memcpy(luma + dat1 + 0x20, memory_tmp+pageoffset + t + 0x00, cp);
+								cp = 0x20;
+							default:
+								memcpy(luma + dat1 + 0x00, memory_tmp+pageoffset + t + 0x20, cp);
+						}
+					}
+					else
+					{
+						memcpy(luma+dat1,memory_tmp+pageoffset+t,xsub); // luma
+					}
+				}
+				else if (stb_type == BRCM72604)
+				{
+					if (t & 0x200)
+					{
+						int cp = xsub % 0x20 ?: 0x20; // cp = xsub % 0x20 ? xsub % 0x20 : 0x20;
+						switch (xsub)
+						{
+							case 0xe1 ... 0x100:
+								memcpy(luma + dat1 + 0xe0, memory_tmp+pageoffset + t + 0xc0, cp);
+								cp = 0x20;
+							case 0xc1 ... 0xe0:
+								memcpy(luma + dat1 + 0xc0, memory_tmp+pageoffset + t + 0xe0, cp);
+								cp = 0x20;
+							case 0xa1 ... 0xc0:
+								memcpy(luma + dat1 + 0xa0, memory_tmp+pageoffset + t + 0x80, cp);
+								cp = 0x20;
+							case 0x81 ... 0xa0:
+								memcpy(luma + dat1 + 0x80, memory_tmp+pageoffset + t + 0xa0, cp);
+								cp = 0x20;
+
+							case 0x61 ... 0x80:
+								memcpy(luma + dat1 + 0x60, memory_tmp+pageoffset + t + 0x40, cp);
+								cp = 0x20;
+							case 0x41 ... 0x60:
+								memcpy(luma + dat1 + 0x40, memory_tmp+pageoffset + t + 0x60, cp);
+								cp = 0x20;
+							case 0x21 ... 0x40:
+								memcpy(luma + dat1 + 0x20, memory_tmp+pageoffset + t + 0x00, cp);
+								cp = 0x20;
+							default:
+								memcpy(luma + dat1 + 0x00, memory_tmp+pageoffset + t + 0x20, cp);
+						}
+					}
+					else
+					{
+						memcpy(luma+dat1,memory_tmp+pageoffset+t,xsub); // luma
+					}
+
+					int ii;
+					unsigned char luma_tmp[0x100];
+
+					for (ii = 0; ii < 0x100; ii+= 0x20) {
+						memcpy(&luma_tmp[ii + 0x00], luma + dat1 + (ii + 0x1c), 0x4);
+						memcpy(&luma_tmp[ii + 0x04], luma + dat1 + (ii + 0x18), 0x4);
+						memcpy(&luma_tmp[ii + 0x08], luma + dat1 + (ii + 0x14), 0x4);
+						memcpy(&luma_tmp[ii + 0x0c], luma + dat1 + (ii + 0x10), 0x4);
+						memcpy(&luma_tmp[ii + 0x10], luma + dat1 + (ii + 0x0c), 0x4);
+						memcpy(&luma_tmp[ii + 0x14], luma + dat1 + (ii + 0x08), 0x4);
+						memcpy(&luma_tmp[ii + 0x18], luma + dat1 + (ii + 0x04), 0x4);
+						memcpy(&luma_tmp[ii + 0x1c], luma + dat1 + (ii + 0x00), 0x4);
+					}
+
+					memcpy(luma + dat1, luma_tmp, xsub);
+				}
+				else
+				{
+					memcpy(luma+dat1,memory_tmp+pageoffset+t,xsub); // luma
+				}
+				dat1+=stride;
+				t+=chr_luma_stride;
+			}
+		}
+		// Hmm apparently lumastride == chromastride?
+		xsub=chr_luma_stride;
+		for (xtmp=0; xtmp < stride; xtmp += chr_luma_stride)
+		{
+			if ((stride-xtmp) <= chr_luma_stride)
+				xsub=stride-xtmp;
+
+			dat1=xtmp;
+			for (ytmp = 0; ytmp < ofs2; ytmp++)
+			{
+				if (stb_type == BRCM7439)
+				{
+					if (t2 & 0x100)
+					{
+						int cp = xsub % 0x20 ?: 0x20;
+						switch (xsub)
+						{
+							case 0x61 ... 0x80:
+								memcpy(chroma + dat1 + 0x60,memory_tmp+pageoffset+offset + t2 + 0x40, cp);
+								cp = 0x20;
+							case 0x41 ... 0x60:
+								memcpy(chroma + dat1 + 0x40, memory_tmp+pageoffset+offset + t2 + 0x60, cp);
+								cp = 0x20;
+							case 0x21 ... 0x40:
+								memcpy(chroma + dat1 + 0x20, memory_tmp+pageoffset+offset + t2 + 0x00, cp);
+								cp = 0x20;
+							default:
+								memcpy(chroma + dat1 + 0x00, memory_tmp+pageoffset+offset + t2 + 0x20, cp);
+						}
+					}
+					else
+					{
+						memcpy(chroma+dat1,memory_tmp+pageoffset+offset+t2,xsub); // chroma
+					}
+				}
+				else if (stb_type == BRCM7439DAGS)
+				{
+					if (t2 & 0x200)
+					{
+						int cp = xsub % 0x20 ?: 0x20;
+						switch (xsub)
+						{
+							case 0xe1 ... 0x100:
+								memcpy(chroma + dat1 + 0xe0,memory_tmp+pageoffset+offset + t2 + 0xc0, cp);
+								cp = 0x20;
+							case 0xc1 ... 0xe0:
+								memcpy(chroma + dat1 + 0xc0,memory_tmp+pageoffset+offset + t2 + 0xe0, cp);
+								cp = 0x20;
+							case 0xa1 ... 0xc0:
+								memcpy(chroma + dat1 + 0xa0,memory_tmp+pageoffset+offset + t2 + 0x80, cp);
+								cp = 0x20;
+							case 0x81 ... 0xa0:
+								memcpy(chroma + dat1 + 0x80,memory_tmp+pageoffset+offset + t2 + 0xa0, cp);
+								cp = 0x20;
+							case 0x61 ... 0x80:
+								memcpy(chroma + dat1 + 0x60,memory_tmp+pageoffset+offset + t2 + 0x40, cp);
+								cp = 0x20;
+							case 0x41 ... 0x60:
+								memcpy(chroma + dat1 + 0x40, memory_tmp+pageoffset+offset + t2 + 0x60, cp);
+								cp = 0x20;
+							case 0x21 ... 0x40:
+								memcpy(chroma + dat1 + 0x20, memory_tmp+pageoffset+offset + t2 + 0x00, cp);
+								cp = 0x20;
+							default:
+								memcpy(chroma + dat1 + 0x00, memory_tmp+pageoffset+offset + t2 + 0x20, cp);
+						}
+					}
+					else
+					{
+						memcpy(chroma+dat1,memory_tmp+pageoffset+offset+t2,xsub); // chroma
+					}
+				}
+				else if (stb_type == BRCM72604)
+				{
+					if (t2 & 0x200)
+					{
+						int cp = xsub % 0x20 ?: 0x20;
+						switch (xsub)
+						{
+							case 0xe1 ... 0x100:
+								memcpy(chroma + dat1 + 0xe0,memory_tmp+pageoffset+offset + t2 + 0xc0, cp);
+								cp = 0x20;
+							case 0xc1 ... 0xe0:
+								memcpy(chroma + dat1 + 0xc0,memory_tmp+pageoffset+offset + t2 + 0xe0, cp);
+								cp = 0x20;
+							case 0xa1 ... 0xc0:
+								memcpy(chroma + dat1 + 0xa0,memory_tmp+pageoffset+offset + t2 + 0x80, cp);
+								cp = 0x20;
+							case 0x81 ... 0xa0:
+								memcpy(chroma + dat1 + 0x80,memory_tmp+pageoffset+offset + t2 + 0xa0, cp);
+								cp = 0x20;
+
+							case 0x61 ... 0x80:
+								memcpy(chroma + dat1 + 0x60,memory_tmp+pageoffset+offset + t2 + 0x40, cp);
+								cp = 0x20;
+							case 0x41 ... 0x60:
+								memcpy(chroma + dat1 + 0x40,memory_tmp+pageoffset+offset + t2 + 0x60, cp);
+								cp = 0x20;
+							case 0x21 ... 0x40:
+								memcpy(chroma + dat1 + 0x20,memory_tmp+pageoffset+offset + t2 + 0x00, cp);
+								cp = 0x20;
+							default:
+								memcpy(chroma + dat1 + 0x00,memory_tmp+pageoffset+offset + t2 + 0x20, cp);
+						}
+					}
+					else
+					{
+						memcpy(chroma+dat1,memory_tmp+pageoffset+offset+t2,xsub); // chroma
+					}
+
+					int ii;
+					unsigned char chroma_tmp[0x100];
+
+					for (ii = 0; ii < 0x100; ii+= 0x20) {
+						memcpy(&chroma_tmp[ii + 0x00], chroma + dat1 + (ii + 0x1c), 0x4);
+						memcpy(&chroma_tmp[ii + 0x04], chroma + dat1 + (ii + 0x18), 0x4);
+						memcpy(&chroma_tmp[ii + 0x08], chroma + dat1 + (ii + 0x14), 0x4);
+						memcpy(&chroma_tmp[ii + 0x0c], chroma + dat1 + (ii + 0x10), 0x4);
+						memcpy(&chroma_tmp[ii + 0x10], chroma + dat1 + (ii + 0x0c), 0x4);
+						memcpy(&chroma_tmp[ii + 0x14], chroma + dat1 + (ii + 0x08), 0x4);
+						memcpy(&chroma_tmp[ii + 0x18], chroma + dat1 + (ii + 0x04), 0x4);
+						memcpy(&chroma_tmp[ii + 0x1c], chroma + dat1 + (ii + 0x00), 0x4);
+					}
+
+					memcpy(chroma + dat1, chroma_tmp, xsub);
+				}
+				else
+				{
+					memcpy(chroma+dat1,memory_tmp+pageoffset+offset+t2,xsub); // chroma
+				}
+				t2+=chr_luma_stride;
+				dat1+=stride;
+			}
+		}
+		munmap(memory_tmp, memory_tmp_size);
+
+		int count = (stride*ofs) >> 2;
+		#pragma omp parallel for
+		for (t = 0; t < count; ++t)
+		{
+			unsigned char* p = luma + (4 * t);
+			unsigned char t;
+			SWAP(p[0], p[3]);
+			SWAP(p[1], p[2]);
+		}
+		count = (stride*ofs2) >> 2;
+		#pragma omp parallel for
+		for (t = 0; t < count; ++t)
+		{
+			unsigned char* p = chroma + (4 * t);
+			unsigned char t;
+			SWAP(p[0], p[3]);
+			SWAP(p[1], p[2]);
+		}
+planes_ready:
+		;
+	}
+	else if (stb_type == DMNEW)
+	{
+#define VIDEOGRABBER_IOC_MAGIC			'D'
+#define VIDEOGRABBER_IOC_SETUP			_IOW(VIDEOGRABBER_IOC_MAGIC, 0x00, struct videograbber_setup_t)
+#define VIDEOGRABBER_IOC_GET_FRAME		_IOR(VIDEOGRABBER_IOC_MAGIC, 0x01, struct videograbber_vframe_t)
+	
+
+		// Init output variables
+		*xres=0;
+		*yres=0;
+
+		int width = 1280;
+		int height = 720;
+		// Set a fixed aspect ratio of 16:9.
+		// Calculation: 256 * height / width.
+		int aspect = 0x90;
+
+		readIntFromFile("/sys/class/video/frame_width", 10, &width);
+		readIntFromFile("/sys/class/video/frame_height", 10, &height);
+		readIntFromFile("/sys/class/video/frame_aspect_ratio", 16, &aspect);
+
+		if (width <= 0 || height <= 0)
+		{
+			width = 1280;
+			height = 720;
+		}
+
+		width = zoomWidth(width, height, aspect); // adjust anamorphic sources, e.g. 720x576 16:9 -> 1024x576
+		if (width <= 0)
+			width = 1280;
+
+		int fd = -1;
+		void *srcAddr = MAP_FAILED;
+		size_t mapLength = 0;
+
+		fd = open("/dev/videograbber", O_RDWR);
+		if (fd < 0)
+		{
+			fprintf(stderr, "videograbber: failed to open device (%m)\n");
+			return;
+		}
+
+		struct videograbber_setup_t setup = { 0 };
+		setup.out_width = width;
+		setup.out_height = height;
+		setup.out_stride = width * 3;
+		setup.out_format = VIDEOGRABBER_FORMAT_RGB888;
+		if (ioctl(fd, VIDEOGRABBER_IOC_SETUP, &setup) < 0)
+		{
+			fprintf(stderr, "getvideo: can't setup videograbber (%m)\n");
+			goto dmerr;
+		}
+
+		struct videograbber_vframe_t vf;
+		memset(&vf, 0, sizeof(vf));
+		if (ioctl(fd, VIDEOGRABBER_IOC_GET_FRAME, &vf) != 0)
+		{
+			fprintf(stderr, "getvideo: can't get current frame (%m)\n");
+			goto dmerr;
+		}
+
+		const int bytes_per_pixel = 3;
+		const size_t packed_stride = (size_t)vf.width[0] * (size_t)bytes_per_pixel;
+		const size_t source_stride = (size_t)vf.stride[0];
+		mapLength = source_stride * (size_t)vf.height[0];
+
+		if (vf.width[0] <= 0 || vf.height[0] <= 0 || source_stride < packed_stride || mapLength == 0)
+		{
+			fprintf(stderr,
+				"getvideo: invalid frame geometry width=%d height=%d stride=%d packed_stride=%zu\n",
+				vf.width[0], vf.height[0], vf.stride[0], packed_stride);
+			goto dmerr;
+		}
+
+		srcAddr = mmap(NULL, mapLength, PROT_READ, MAP_SHARED, fd, (off_t)vf.canvas_phys_addr[0]);
+		if (srcAddr == MAP_FAILED)
+		{
+			fprintf(stderr, "getvideo: error while mapping src buffer (%m)\n");
+			goto dmerr;
+		}
+
+		for (int y = 0; y < vf.height[0]; y++)
+		{
+			memcpy(video + ((size_t)y * packed_stride),
+			       (const unsigned char *)srcAddr + ((size_t)y * source_stride),
+			       packed_stride);
+		}
+
+		*xres = vf.width[0];
+		*yres = vf.height[0];
+
+dmerr:
+		if (srcAddr != MAP_FAILED)
+			munmap(srcAddr, mapLength);
+		if (fd >= 0)
+			close(fd);
+
+		return;
+
+	}
+	else if (stb_type == WETEK)
+	{
+#define AMVIDEOCAP_IOC_MAGIC  'V'
+#define AMVIDEOCAP_IOW_SET_START_CAPTURE _IOW(AMVIDEOCAP_IOC_MAGIC, 0x32, int)
+
+		int fd;
+		int ret;
+		char *mbuf;
+
+		// Init output variables
+		*xres=0;
+		*yres=0;
+
+		fp = fopen("/proc/stb/vmpeg/0/xres","r");
+		if (fp)
+		{
+			while (fgets(buf,sizeof(buf),fp))
+			{
+				sscanf(buf,"%x",&stride);
+			}
+			fclose(fp);
+		}
+
+		fp = fopen("/proc/stb/vmpeg/0/yres","r");
+		if (fp)
+		{
+			while (fgets(buf,sizeof(buf),fp))
+			{
+				sscanf(buf,"%x",&res);
+			}
+			fclose(fp);
+		}
+
+		if((stride == 0) || (res == 0)) return;
+
+		fd = open("/dev/amvideocap0", O_RDWR);
+		if (fd < 0)
+			return;
+
+		ioctl(fd, AMVIDEOCAP_IOW_SET_START_CAPTURE, 10000);
+		mbuf = mmap(NULL, stride * res * 3, PROT_READ, MAP_SHARED, fd, 0);
+		if(mbuf == MAP_FAILED) {
+			close(fd);
+			fprintf(stderr, "Mainmemory: <Memmapping failed 5>\n");
+			return;
+		}
+		memcpy(video, mbuf, stride * res * 3);
+		munmap(mbuf, stride * res * 3);
+		close(fd);
+		*xres=stride;
+		*yres=res;
+		return;
+
+	}
+	else if (stb_type == AZBOX863x || stb_type == AZBOX865x)
+	{
+
+	  unsigned char *infos = 0 ,*lyuv = 0, *ptr;
+	  int fd, len = 0, x, y;
+	  unsigned int	chroma_w, chroma_h;
+	  unsigned int	luma_w, luma_h;
+	  unsigned int	luma_width, chroma_width;
+	  unsigned int	luma_size_tile, chroma_size_tile;
+	  unsigned char  *pluma;
+	  unsigned char  *pchroma;
+
+	   fd = open("/dev/frameyuv",O_RDWR);
+	   if(!fd) {
+		perror("/dev/frameyuv");
+		return;
+	   }
+
+	   infos = malloc(1920*1080*4);
+	   len = read(fd,infos,1920*1080*4);
+
+	   if(len <= 0 ) {
+		 fprintf(stderr,"No picture info %d\n",len);
+		 free(infos);
+		 close(fd);
+		 return;
+	    }
+
+	    luma_w = (infos[0]<<24) | (infos[1]<<16) | (infos[2]<<8) | (infos[3]);
+	    luma_h = (infos[4]<<24) | (infos[5]<<16) | (infos[6]<<8) | (infos[7]);
+	    luma_width = (infos[8]<<24) | (infos[9]<<16) | (infos[10]<<8) | (infos[11]);
+	    chroma_w = (infos[12]<<24) | (infos[13]<<16) | (infos[14]<<8) | (infos[15]);
+	    chroma_h = (infos[16]<<24) | (infos[17]<<16) | (infos[18]<<8) | (infos[19]);
+	    chroma_width = (infos[20]<<24) | (infos[21]<<16) | (infos[22]<<8) | (infos[23]);
+
+	    if (stb_type == AZBOX863x) {
+
+		luma_size_tile	= (((luma_w + 127)/128)*128) *  (((luma_h + 31)/32)*32);
+
+		chroma_size_tile	= (((chroma_w + 127)/128)*128) * (((chroma_h + 31)/32)*32);
+	     } else {
+
+		luma_size_tile	= (((luma_w + 255)/256)*256) *  (((luma_h + 31)/32)*32);
+
+		chroma_size_tile	= (((chroma_w + 255)/256)*256) * (((chroma_h + 31)/32)*32);
+	     }
+
+	     pluma = infos + 24;
+	     pchroma = infos + 24 +luma_size_tile;
+
+	     luma = (unsigned char *)malloc(luma_w * luma_h);
+	     chroma = (unsigned char *)malloc(chroma_w * chroma_h * 2);
+
+	     stride = luma_w;
+	     res = luma_h;
+
+	     ptr = luma;
+	     if (stb_type == AZBOX863x) {
+		 /* save the luma buffer Y */
+		for (y = 0 ; y < luma_h ; y++) {
+	    	  for (x = 0 ; x < luma_w ; x++) {
+			 unsigned char* pixel = (pluma +\
+			 (x/128) * 4096 + (y/32) * luma_width * 32 +
+			 (x % 128) + (y % 32)*128);
+
+			*ptr++ = *pixel;
+			}
+		  }
+
+		ptr = chroma;
+
+		/* break chroma buffer into U & V components */
+		for (y = 0 ; y < chroma_h ; y++) {
+			for (x = 0 ; x < chroma_w*2 ; x++) {
+				unsigned char* pixel = (pchroma +\
+			    (x/128) * 4096 + (y/32) * chroma_width * 32 +
+				 (x % 128) + (y % 32)*128);
+
+		 *ptr++ = *pixel;
+		 }
+	       }
+	     } else if (stb_type == AZBOX865x) {
+
+		 /* save the luma buffer Y */
+		for (y = 0 ; y < luma_h ; y++) {
+	    	  for (x = 0 ; x < luma_w ; x++) {
+			 unsigned char* pixel = (pluma +\
+			 (x/256) * 8192 + (y/32) * luma_width * 32 +
+			 (x % 256) + (y % 32)*256);
+
+			*ptr++ = *pixel;
+			}
+		  }
+
+		ptr = chroma;
+
+		/* break chroma buffer into U & V components */
+		for (y = 0 ; y < chroma_h ; y++) {
+			for (x = 0 ; x < chroma_w*2 ; x++) {
+				unsigned char* pixel = (pchroma +\
+			    (x/256) * 8192 + (y/32) * chroma_width * 32 +
+				 (x % 256) + (y % 32)*256);
+
+		 *ptr++ = *pixel;
+		 }
+
+
+	      }
+	     }
+	   	free(infos);
+		close(fd);
+	}
+#if defined(__sh__)
+	else if (stb_type == ST)
+	{
+		int yblock, xblock, iyblock, ixblock, yblockoffset, offset, layer_offset, OUTITER, OUTINC, OUTITERoffset;
+		int stride_half;
+		unsigned char *out;
+		unsigned char even, cr;
+		int fd_bpa;
+		int ioctlres;
+		BPAMemMapMemData bpa_data;
+		char bpa_mem_device[30];
+		char *decode_surface;
+		int delay;
+
+		// Init output variables
+		*xres=0;
+		*yres=0;
+
+		fp = fopen("/proc/stb/vmpeg/0/xres","r");
+		if (fp)
+		{
+			while (fgets(buf,sizeof(buf),fp))
+			{
+				sscanf(buf,"%x",&stride);
+			}
+			fclose(fp);
+		}
+		fp = fopen("/proc/stb/vmpeg/0/yres","r");
+		if (fp)
+		{
+			while (fgets(buf,sizeof(buf),fp))
+			{
+				sscanf(buf,"%x",&res);
+			}
+			fclose(fp);
+		}
+
+		//if stride and res are zero return (please note that stillpictures will not be captured)
+		if((stride == 0)&&(res == 0)) return;
+
+
+		fd_bpa = open("/dev/bpamem0", O_RDWR);
+		if(fd_bpa < 0)
+		{
+			fprintf(stderr, "cannot access /dev/bpamem0! err = %d\n", fd_bpa);
+			return;
+		}
+		bpa_data.bpa_part  = "LMI_VID";
+		bpa_data.phys_addr = 0x00000000;
+		bpa_data.mem_size = 0;
+
+		fp = fopen("/proc/bpa2","r");
+		if (fp)
+		{
+			unsigned char found_part = 0;
+			unsigned long mem_size = 0;
+			unsigned long phys_addr = 0;
+			while (fgets(buf,sizeof(buf),fp))
+			{
+				if(found_part || strstr(buf, bpa_data.bpa_part) != NULL)
+				{
+					found_part = 1;
+					if (sscanf(buf, "- %lu B at %lx", &mem_size, &phys_addr) == 2)
+					{
+						if(mem_size > bpa_data.mem_size)
+						{
+							bpa_data.mem_size  = mem_size;
+							bpa_data.phys_addr = phys_addr;
+						}
+					}
+				}
+			}
+			fclose(fp);
+		}
+
+		printf("Using bpa2 part %s - 0x%lx %lu\n", bpa_data.bpa_part, bpa_data.phys_addr, bpa_data.mem_size);
+
+		//bpa_data.phys_addr = 0x4a824000;
+		//bpa_data.mem_size = 28311552;
+
+		ioctlres = ioctl(fd_bpa, BPAMEMIO_MAPMEM, &bpa_data); // request memory from bpamem
+		if(ioctlres)
+		{
+			fprintf(stderr, "cannot map required mem\n");
+			return;
+		}
+
+		sprintf(bpa_mem_device, "/dev/bpamem%d", bpa_data.device_num);
+		close(fd_bpa);
+
+		fd_bpa = open(bpa_mem_device, O_RDWR);
+
+		// if somebody forgot to add all bpamem devs then this gets really bad here
+		if(fd_bpa < 0)
+		{
+			fprintf(stderr, "cannot access %s! err = %d\n", bpa_mem_device, fd_bpa);
+			return;
+		}
+
+		char *decode_map = (char *)mmap(0, bpa_data.mem_size, PROT_WRITE|PROT_READ, MAP_SHARED, fd_bpa, 0);
+		if(decode_map == MAP_FAILED)
+		{
+			fprintf(stderr, "could not map bpa mem\n");
+			close(fd_bpa);
+			return;
+		}
+
+		fprintf(stderr, "decode surface size:  %d\n", bpa_data.mem_size );
+
+		//if stride and res is zero than this is most probably a stillpicture
+		//if(stride == 0) stride = 1280;
+		//if(res == 0) res = 720;
+
+		stride_half = stride / 2;
+
+		luma   = (unsigned char *)malloc(stride * res);
+		chroma = (unsigned char *)malloc(stride * res / 2);
+		char *temp = (unsigned char *)malloc(4 * 1024 * 1024);
+		if( NULL == temp )  {
+			printf("can not allocate memory\n");
+			return;
+		}
+
+		memset(chroma, 0x80, stride * res / 2);
+		memset(luma, 0x00, stride * res); /* just to invalidate the page */
+		memset(temp, 0x00, 4 * 1024 * 1024); /* just to invalidate the page */
+
+		//luma
+		layer_offset = 0;
+
+		//we do not have to round that every luma res will be a multiple of 16
+		yblock = res/16; //45
+		xblock = stride/16; //80
+
+		//thereby yblockoffset does also not to be rounded up
+		yblockoffset = xblock * 256/*16x16px*/ * 2/*2 block rows*/; //0xA000 for 1280
+
+		//printf("yblock: %u xblock:%u yblockoffset:0x%x\n", yblock, xblock, yblockoffset);
+
+		OUTITER       = 0;
+		OUTITERoffset = 0;
+		OUTINC        = 1; /*no spaces between pixel*/
+		out           = luma;
+
+		struct timeval start_tv;
+		struct timeval stop_tv;
+		struct timeval result_tv;
+
+
+		//wait_for_frame_sync
+		{
+			unsigned char old_frame[0x800]; /*first 2 luma blocks, 0:0 - 32:64*/
+			memcpy(old_frame, decode_map, 0x800);
+			gettimeofday(&start_tv, NULL);
+			memcmp(decode_map, old_frame, 0x800);
+			gettimeofday(&stop_tv, NULL);
+			for(delay = 0; delay < 500/*ms*/; delay++)
+			{
+				if (memcmp(decode_map, old_frame, 0x800) != 0)
+					break;
+				usleep(100);
+			}
+		}
+		//gettimeofday(&start_tv, NULL);
+		memcpy(temp,decode_map,4*1024*1024);
+		//gettimeofday(&stop_tv, NULL);
+		decode_surface = temp;
+
+		//now we have 16,6ms(60hz) to 50ms(20hz) to get the whole picture
+		for(even = 0; even < 2; even++)
+		{
+			offset        = layer_offset + (even  << 8 /* * 0x100*/);
+			OUTITERoffset = even * xblock << 8 /* * 256=16x16px*/;
+
+			for (iyblock = even; iyblock < yblock; iyblock+=2)
+			{
+				for (ixblock = 0; ixblock < xblock; ixblock++)
+				{
+					int line;
+
+					OUTITER = OUTITERoffset;
+					for (line = 0; line < 16; line++)
+					{
+						OUT_LU_16(offset, line);
+						OUTITER += (stride - 16 /*we have already incremented by 16*/);
+					}
+
+					//0x00, 0x200, ...
+					offset += 0x200;
+					OUTITERoffset += 16;
+				}
+				OUTITERoffset += (stride << 5) - stride /* * 31*/;
+			}
+		}
+
+		//chroma
+		layer_offset = ((stride*res + (yblockoffset >> 1 /* /2*/ /*round up*/)) / yblockoffset) * yblockoffset;
+
+		//cb
+		//we do not have to round that every chroma y res will be a multiple of 16
+		//and every chroma x res /2 will be a multiple of 8
+		yblock = res >> 4 /* /16*/; //45
+		xblock = stride_half >> 3 /* /8*/; //no roundin
+
+		//if xblock is not even than we will have to move to the next even value an
+		yblockoffset = (((xblock + 1) >> 1 /* / 2*/) << 1 /* * 2*/ ) << 8 /* * 64=8x8px * 2=2 block rows * 2=cr cb*/;
+
+		//printf("yblock: %u xblock:%u yblockoffset:0x%x\n", yblock, xblock, yblockoffset);
+
+		OUTITER       = 0;
+		OUTITERoffset = 0;
+		OUTINC        = 2;
+		out           = chroma;
+
+		for(cr = 0; cr < 2; cr++)
+		{
+			for(even = 0; even < 2; even++)
+			{
+				offset        = layer_offset + (even  << 8 /* * 0x100*/);
+				OUTITERoffset = even * (xblock << 7 /* * 128=8x8px * 2*/) + cr;
+
+				for (iyblock = even; iyblock < yblock; iyblock+=2)
+				{
+					for (ixblock = 0; ixblock < xblock; ixblock++)
+					{
+						int line;
+						OUTITER = OUTITERoffset;
+
+						for (line = 0; line < 8; line++)
+						{
+							OUT_CH_8(offset, line, !cr);
+							OUTITER += (stride - 16 /*we have already incremented by OUTINC*8=16*/);
+						}
+
+						//0x00 0x80 0x200 0x280, ...
+						offset += (offset%0x100?0x180/*80->200*/:0x80/*0->80*/);
+						OUTITERoffset += 16/*OUTINC*8=16*/;
+					}
+					OUTITERoffset += (stride << 4) - stride /* * 15*/;
+				}
+			}
+		}
+		timeval_subtract(&result_tv,&stop_tv,&start_tv);
+		printf("framesync after:     %dms\n", delay);
+		printf("frame copy duration: %fms\n", (((float)result_tv.tv_sec)*1000.0f+((float)result_tv.tv_usec)/1000.0f));
+
+		munmap(decode_map, bpa_data.mem_size);
+
+		ioctlres = ioctl(fd_bpa, BPAMEMIO_UNMAPMEM); // request memory from bpamem
+		if(ioctlres)
+		{
+			fprintf(stderr, "cannot unmap required mem\n");
+			close(fd_bpa);
+			return;
+		}
+
+		close(fd_bpa);
+	}
+#endif
+	else if (stb_type == XILLEON)
+	{
+		// grab xilleon pic from decoder memory
+		fp = fopen("/proc/stb/vmpeg/0/xres","r");
+		if (fp)
+		{
+			while (fgets(buf,sizeof(buf),fp))
+			{
+				sscanf(buf,"%x",&stride);
+			}
+			fclose(fp);
+		}
+		fp = fopen("/proc/stb/vmpeg/0/yres","r");
+		if (fp)
+		{
+			while (fgets(buf,sizeof(buf),fp))
+			{
+				sscanf(buf,"%x",&res);
+			}
+			fclose(fp);
+		}
+
+		if((memory = (unsigned char*)mmap(0, 1920*1152*6, PROT_READ, MAP_SHARED, mem_fd, 0x6000000)) == MAP_FAILED)
+		{
+			fprintf(stderr, "Mainmemory: <Memmapping failed 6>\n");
+			return;
+		}
+
+		luma = (unsigned char *)malloc(1920*1152);
+		chroma = (unsigned char *)malloc(1920*576);
+
+		int offset=1920*1152*5;	// offset for chroma buffer
+
+		const unsigned char* frame_l = memory; // luma frame from video decoder
+		const unsigned char* frame_c = memory + offset; // chroma frame from video decoder
+
+		int xtmp,ytmp,ysub,xsub;
+		const int ypart=32;
+		const int xpart=128;
+		int oe2=0;
+		int ysubcount=res/32;
+		int ysubchromacount=res/64;
+
+		// "decode" luma/chroma, there are 128x32pixel blocks inside the decoder mem
+		for (ysub=0; ysub<=ysubcount; ysub++)
+		{
+			for (xsub=0; xsub<15; xsub++) // 1920/128=15
+			{
+				// Even lines
+				for (ytmp=0; ytmp<ypart; ytmp++)
+				{
+					int extraoffset = (stride*(ytmp+(ysub*ypart)));
+					int destx = xsub*xpart;
+					int overflow = (destx + xpart) - stride;
+					if (overflow <= 0)
+					{
+						// We copy a bit too much...
+						memcpy(luma + destx + extraoffset, frame_l, xpart);
+					}
+					else if (overflow < xpart)
+					{
+                                                memcpy(luma + destx + extraoffset, frame_l, overflow);
+					}
+					frame_l += xpart;
+				}
+			}
+			++ysub; // dirty...
+			for (xsub=0; xsub<15; xsub++) // 1920/128=15
+			{
+				// Odd lines (reverts 64 byte block?)
+				// Only luminance
+				for (ytmp=0; ytmp<ypart; ytmp++)
+				{
+					int extraoffset = (stride*(ytmp+(ysub*ypart)));
+					int destx = xsub*xpart;
+					int overflow = (destx + xpart) - stride;
+					if (overflow <= 0)
+					{
+						// We copy a bit too much...
+						memcpy(luma + destx + extraoffset + 64, frame_l, 64);
+						memcpy(luma + destx + extraoffset, frame_l + 64, 64);
+					}
+					else if (overflow < xpart)
+					{
+						if (overflow > 64)
+						{
+							memcpy(luma + destx + extraoffset + 64, frame_l, overflow-64);
+							memcpy(luma + destx + extraoffset, frame_l + 64, 64);
+						}
+						else
+						{
+							memcpy(luma + destx + extraoffset, frame_l + 64, overflow);
+						}
+					}
+					frame_l += xpart;
+				}
+			}
+		}
+
+		// Chrominance (half resolution)
+		ysubcount /= 2;
+		for (ysub=0; ysub<=ysubcount; ysub++)
+		{
+			for (xsub=0; xsub<15; xsub++) // 1920/128=15
+			{
+				// Even lines
+				for (ytmp=0; ytmp<ypart; ytmp++)
+				{
+					int extraoffset = (stride*(ytmp+(ysub*ypart)));
+					int destx = xsub*xpart;
+					int overflow = (destx + xpart) - stride;
+					if (overflow <= 0)
+					{
+						memcpy(chroma + destx + extraoffset, frame_c, xpart);
+					}
+					else if (overflow < xpart)
+					{
+                                                memcpy(chroma + destx + extraoffset, frame_c, overflow);
+					}
+					frame_c += xpart;
+				}
+			}
+			++ysub; // dirty...
+			for (xsub=0; xsub<15; xsub++) // 1920/128=15
+			{
+				// Odd lines (reverts 64 byte block?)
+				// Only luminance
+				for (ytmp=0; ytmp<ypart; ytmp++)
+				{
+					int extraoffset = (stride*(ytmp+(ysub*ypart)));
+					int destx = xsub*xpart;
+					int overflow = (destx + xpart) - stride;
+					if (overflow <= 0)
+					{
+						// We copy a bit too much...
+						memcpy(chroma + destx + extraoffset + 64, frame_c, 64);
+						memcpy(chroma + destx + extraoffset, frame_c + 64, 64);
+					}
+					else if (overflow < xpart)
+					{
+						if (overflow > 64)
+						{
+							memcpy(chroma + destx + extraoffset + 64, frame_c, overflow-64);
+							memcpy(chroma + destx + extraoffset, frame_c + 64, 64);
+						}
+						else
+						{
+							memcpy(chroma + destx + extraoffset, frame_c + 64, overflow);
+						}
+					}
+					frame_c += xpart;
+				}
+			}
+		}
+
+
+		munmap(memory, 1920*1152*6);
+
+	}
+	else if (stb_type == VULCAN || stb_type == PALLAS)
+	{
+		// grab via v4l device (ppc boxes)
+
+		memory_tmp = (unsigned char *)malloc(720 * 576 * 3 + 16);
+
+		int fd_video = open(VIDEO_DEV, O_RDONLY);
+		if (fd_video < 0)
+		{
+			fprintf(stderr, "could not open /dev/video");
+			return;
+		}
+
+		int r = read(fd_video, memory_tmp, 720 * 576 * 3 + 16);
+		if (r < 16)
+		{
+			fprintf(stderr, "read failed\n");
+			close(fd_video);
+			return;
+		}
+		close(fd_video);
+
+		int *size = (int*)memory_tmp;
+		stride = size[0];
+		res = size[1];
+
+		luma = (unsigned char *)malloc(stride * res);
+		chroma = (unsigned char *)malloc(stride * res);
+
+		memcpy (luma, memory_tmp + 16, stride * res);
+		memcpy (chroma, memory_tmp + 16 + stride * res, stride * res);
+
+		free(memory_tmp);
+	}
+
+	close(mem_fd);
+
+	const size_t max_video_pixels = stb_supports_uhd_grab_buffers() ? 3840U * 2160U : 1920U * 1080U;
+	if (stride <= 0 || res <= 0 ||
+	    (size_t)stride > max_video_pixels / (size_t)res)
+	{
+		fprintf(stderr,
+			"getvideo: refusing unsafe frame geometry %dx%d for allocated buffers\n",
+			stride, res);
+		free(luma);
+		free(chroma);
+		return;
+	}
+
+	// yuv2rgb conversion (4:2:0)
+	const int rgbstride = stride * 3;
+	const int scans = res / 2;
+	int y;
+	#pragma omp parallel for
+	for (y=0; y < scans; ++y)
+	{
+		int x;
+		int out1 = y * rgbstride * 2;
+		int pos = y * stride * 2;
+		const unsigned char* chroma_p = chroma + (y * stride);
+
+		for (x=stride; x != 0; x-=2)
+		{
+			int U = *chroma_p++;
+			int V = *chroma_p++;
+
+			int RU=yuv2rgbtable_ru[U]; // use lookup tables to speedup the whole thing
+			int GU=yuv2rgbtable_gu[U];
+			int GV=yuv2rgbtable_gv[V];
+			int BV=yuv2rgbtable_bv[V];
+
+			switch (stb_type) //on xilleon we use bgr instead of rgb so simply swap the coeffs
+			{
+				case XILLEON:
+					SWAP(RU,BV);
+					break;
+			}
+
+			// now we do 4 pixels on each iteration this is more code but much faster
+			int Y=yuv2rgbtable_y[luma[pos]];
+
+			video[out1]=CLAMP((Y + RU)>>16);
+			video[out1+1]=CLAMP((Y - GV - GU)>>16);
+			video[out1+2]=CLAMP((Y + BV)>>16);
+
+			Y=yuv2rgbtable_y[luma[stride+pos]];
+
+			video[out1+rgbstride]=CLAMP((Y + RU)>>16);
+			video[out1+1+rgbstride]=CLAMP((Y - GV - GU)>>16);
+			video[out1+2+rgbstride]=CLAMP((Y + BV)>>16);
+
+			pos++;
+			out1+=3;
+
+			Y=yuv2rgbtable_y[luma[pos]];
+
+			video[out1]=CLAMP((Y + RU)>>16);
+			video[out1+1]=CLAMP((Y - GV - GU)>>16);
+			video[out1+2]=CLAMP((Y + BV)>>16);
+
+			Y=yuv2rgbtable_y[luma[stride+pos]];
+
+			video[out1+rgbstride]=CLAMP((Y + RU)>>16);
+			video[out1+1+rgbstride]=CLAMP((Y - GV - GU)>>16);
+			video[out1+2+rgbstride]=CLAMP((Y + BV)>>16);
+
+			out1+=3;
+			pos++;
+		}
+	}
+
+	*xres=stride;
+	*yres=res;
+	free(luma);
+	free(chroma);
 }
 
 static const char e2egl_capture_magic[8] = {'E', '2', 'E', 'G', 'L', '0', '1', 0};
@@ -1063,8 +5355,14 @@ static int e2egl_read_exact(int fd, void *data, size_t len)
 	while (len)
 	{
 		ssize_t bytes = recv(fd, ptr, len, 0);
-		if (bytes < 0) { if (errno == EINTR) continue; return 0; }
-		if (!bytes) return 0;
+		if (bytes < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			return 0;
+		}
+		if (!bytes)
+			return 0;
 		ptr += bytes;
 		len -= (size_t)bytes;
 	}
@@ -1074,23 +5372,39 @@ static int e2egl_read_exact(int fd, void *data, size_t len)
 static int getosd_e2egl(unsigned char *osd, int *xres, int *yres)
 {
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0)
+		return 0;
+
 	struct timeval timeout;
-	struct sockaddr_un addr;
-	struct e2egl_capture_header header;
-	size_t width, height, stride, max_pixels, row_bytes;
-	if (fd < 0) return 0;
-	timeout.tv_sec = 2; timeout.tv_usec = 0;
+	timeout.tv_sec = 2;
+	timeout.tv_usec = 0;
 	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+	struct sockaddr_un addr;
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
 	strncpy(addr.sun_path, E2EGL_CAPTURE_SOCKET, sizeof(addr.sun_path) - 1);
-	if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(fd); return 0; }
+
+	if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0)
+	{
+		close(fd);
+		return 0;
+	}
+
+	struct e2egl_capture_header header;
 	if (!e2egl_read_exact(fd, &header, sizeof(header)))
-	{ if (!quiet) fprintf(stderr, "e2egl OSD capture failed: no header\n"); close(fd); return -1; }
-	width = (size_t)header.width;
-	height = (size_t)header.height;
-	stride = (size_t)header.stride;
-	max_pixels = E2EGL_CAPTURE_MAX_PIXELS;
+	{
+		if (!quiet)
+			fprintf(stderr, "e2egl OSD capture failed: no header\n");
+		close(fd);
+		return -1;
+	}
+
+	const size_t width = (size_t)header.width;
+	const size_t height = (size_t)header.height;
+	const size_t stride = (size_t)header.stride;
+	const size_t max_pixels = E2EGL_CAPTURE_MAX_PIXELS;
+
 	if (memcmp(header.magic, e2egl_capture_magic, sizeof(header.magic)) ||
 	    header.format != E2EGL_CAPTURE_FORMAT_BGRA ||
 	    width == 0 || height == 0 ||
@@ -1098,44 +5412,65 @@ static int getosd_e2egl(unsigned char *osd, int *xres, int *yres)
 	{
 		if (!quiet)
 			fprintf(stderr, "e2egl OSD capture failed: invalid header %zux%zu stride=%zu format=%u\n",
-			        width, height, stride, header.format);
-		close(fd); return -1;
+				width, height, stride, header.format);
+		close(fd);
+		return -1;
 	}
-	row_bytes = width * 4U;
+
+	const size_t row_bytes = width * 4U;
 	if (height > ((size_t)-1) / row_bytes ||
-	    width * height > max_pixels || stride < row_bytes || stride > 32768U)
+	    width * height > max_pixels ||
+	    stride < row_bytes || stride > 32768U)
 	{
 		if (!quiet)
 			fprintf(stderr, "e2egl OSD capture failed: invalid geometry %zux%zu stride=%zu\n",
-			        width, height, stride);
-		close(fd); return -1;
+				width, height, stride);
+		close(fd);
+		return -1;
 	}
+
 	if (stride == row_bytes)
 	{
 		if (!e2egl_read_exact(fd, osd, row_bytes * height))
-		{ if (!quiet) fprintf(stderr, "e2egl OSD capture failed: short image\n"); close(fd); return -1; }
+		{
+			if (!quiet)
+				fprintf(stderr, "e2egl OSD capture failed: short image\n");
+			close(fd);
+			return -1;
+		}
 	}
 	else
 	{
 		unsigned char *row = (unsigned char*)malloc(stride);
-		size_t y;
-		if (!row) { close(fd); return -1; }
-		for (y = 0; y < height; ++y)
+		if (!row)
+		{
+			close(fd);
+			return -1;
+		}
+		for (size_t y = 0; y < height; ++y)
 		{
 			if (!e2egl_read_exact(fd, row, stride))
 			{
-				if (!quiet) fprintf(stderr, "e2egl OSD capture failed: short image row\n");
-				free(row); close(fd); return -1;
+				if (!quiet)
+					fprintf(stderr, "e2egl OSD capture failed: short image row\n");
+				free(row);
+				close(fd);
+				return -1;
 			}
 			memcpy(osd + y * row_bytes, row, row_bytes);
 		}
 		free(row);
 	}
+
 	close(fd);
-	*xres = (int)width; *yres = (int)height;
-	if (!quiet) fprintf(stderr, "Grabbing e2egl OSD ...\n... e2egl OSD-Size: %d x %d\n", *xres, *yres);
+	*xres = (int)width;
+	*yres = (int)height;
+	if (!quiet)
+		fprintf(stderr, "Grabbing e2egl OSD ...\n... e2egl OSD-Size: %d x %d\n", *xres, *yres);
 	return 1;
 }
+
+// grabing the osd picture
 
 void getosd(unsigned char *osd, int *xres, int *yres)
 {
@@ -1186,18 +5521,24 @@ void getosd(unsigned char *osd, int *xres, int *yres)
 		return;
 	}
 
-	/* Triple-buffered framebuffer fix (DM900/DM920) */
-	if ((stb_type == BRCM7439 || stb_type == BRCM7252S) &&
+	/*
+	 * Triple-buffered framebuffer fix (DM900/DM920, stb_type == BRCM7439):
+	 * Enigma2 rotates OSD pages by panning to Y=0, Y=yres, Y=2*yres.  The
+	 * code below reads from offset 0 in lfb, but the currently-displayed
+	 * frame may be at a higher yoffset.  Fix: memmove the front-buffer page
+	 * to Y=0 in the mmap, then call FBIOPAN_DISPLAY to move the hardware
+	 * pointer to Y=0.  Grab then reads the correct frame and E2 will not
+	 * render into Y=0 while it is the hardware front buffer.
+	 */
+	if (stb_type == BRCM7439 &&
 	    var_screeninfo.yres_virtual > var_screeninfo.yres && var_screeninfo.yoffset != 0)
 	{
 		unsigned long src_off   = (unsigned long)var_screeninfo.yoffset * fix_screeninfo.line_length;
 		unsigned long page_bytes = (unsigned long)var_screeninfo.yres   * fix_screeninfo.line_length;
 		memmove(lfb, lfb + src_off, page_bytes);
-		var_screeninfo.activate = FB_ACTIVATE_NOW;
 		var_screeninfo.xoffset = 0;
 		var_screeninfo.yoffset = 0;
 		ioctl(fb, FBIOPAN_DISPLAY, &var_screeninfo);
-		usleep(20000);
 	}
 
 	const int fb_bytespp = var_screeninfo.bits_per_pixel / 8;
@@ -1214,9 +5555,12 @@ void getosd(unsigned char *osd, int *xres, int *yres)
 	{
 		fprintf(stderr,
 			"Framebuffer: invalid geometry xres=%u yres=%u xoffset=%u yoffset=%u line_length=%u smem_len=%u bpp=%u\n",
-			var_screeninfo.xres, var_screeninfo.yres,
-			var_screeninfo.xoffset, var_screeninfo.yoffset,
-			fix_screeninfo.line_length, fix_screeninfo.smem_len,
+			var_screeninfo.xres,
+			var_screeninfo.yres,
+			var_screeninfo.xoffset,
+			var_screeninfo.yoffset,
+			fix_screeninfo.line_length,
+			fix_screeninfo.smem_len,
 			var_screeninfo.bits_per_pixel);
 		munmap(lfb, fix_screeninfo.smem_len);
 		close(fb);
@@ -1229,16 +5573,19 @@ void getosd(unsigned char *osd, int *xres, int *yres)
 	{
 		if (!quiet)
 			fprintf(stderr, "Grabbing 32bit Framebuffer ...\n");
+
+		// get 32bit framebuffer
 		for (y=0; y < var_screeninfo.yres; y+=1)
 			memcpy(osd + ((size_t)y * (size_t)var_screeninfo.xres * 4U),
 			       fb_page + ((size_t)y * (size_t)fix_screeninfo.line_length),
 			       (size_t)var_screeninfo.xres * 4U);
-	}
-	else if ( var_screeninfo.bits_per_pixel == 16 )
+	} else if ( var_screeninfo.bits_per_pixel == 16 )
 	{
 		if (!quiet)
 			fprintf(stderr, "Grabbing 16bit Framebuffer ...\n");
 		unsigned short color;
+
+		// get 16bit framebuffer
 		pos=pos1=pos2=0;
 		ofs=fix_screeninfo.line_length-(var_screeninfo.xres*2);
 		for (y=0; y < var_screeninfo.yres; y+=1)
@@ -1247,10 +5594,11 @@ void getosd(unsigned char *osd, int *xres, int *yres)
 			{
 				color = fb_page[pos2] << 8 | fb_page[pos2+1];
 				pos2+=2;
-				osd[pos1++] = BLUE565(color);
-				osd[pos1++] = GREEN565(color);
-				osd[pos1++] = RED565(color);
-				osd[pos1++]=0x00;
+
+				osd[pos1++] = BLUE565(color); // b
+				osd[pos1++] = GREEN565(color); // g
+				osd[pos1++] = RED565(color); // r
+				osd[pos1++]=0x00; // tr - there is no transparency in 16bit mode
 			}
 			pos2+=ofs;
 		}
@@ -1260,6 +5608,9 @@ void getosd(unsigned char *osd, int *xres, int *yres)
 		if (!quiet)
 			fprintf(stderr, "Grabbing 8bit Framebuffer ...\n");
 		unsigned short color;
+
+		// Read Color Palette directly from the main memory, because the FBIOGETCMAP is buggy on dream and didnt
+		// gives you the correct colortable !
 		int mem_fd;
 		unsigned char *memory;
 		unsigned short rd[256], gn[256], bl[256], tr[256];
@@ -1275,22 +5626,30 @@ void getosd(unsigned char *osd, int *xres, int *yres)
 			return;
 		}
 
-		if (stb_type == VULCAN)
+		if (stb_type == VULCAN) // DM500/5620 stores the colors as a 16bit word with yuv values, so we have to convert :(
 		{
 			unsigned short yuv;
 			pos2 = 0;
 			for (pos1=16; pos1<(256*2)+16; pos1+=2)
 			{
+
 				yuv = memory[pos1] << 8 | memory[pos1+1];
+
 				rd[pos2]=CLAMP((76310*(YFB(yuv)-16) + 104635*(CRFB(yuv)-128))>>16);
 				gn[pos2]=CLAMP((76310*(YFB(yuv)-16) - 53294*(CRFB(yuv)-128) - 25690*(CBFB(yuv)-128))>>16);
 				bl[pos2]=CLAMP((76310*(YFB(yuv)-16) + 132278*(CBFB(yuv)-128))>>16);
-				if (yuv == 0) { rd[pos2]=gn[pos2]=bl[pos2]=0; tr[pos2]=0x00; }
-				else tr[pos2]=0xFF;
+
+				if (yuv == 0) // transparency is a bit tricky, there is a 2 bit blending value BFFB(yuv), but not really used
+				{
+					rd[pos2]=gn[pos2]=bl[pos2]=0;
+					tr[pos2]=0x00;
+				} else
+					tr[pos2]=0xFF;
+
 				pos2++;
 			}
 		}
-		else if (stb_type == PALLAS)
+		else if (stb_type == PALLAS) // DM70x0 stores the colors in plain rgb values
 		{
 			pos2 = 0;
 			for (pos1=32; pos1<(256*4)+32; pos1+=4)
@@ -1309,6 +5668,7 @@ void getosd(unsigned char *osd, int *xres, int *yres)
 		}
 		close(mem_fd);
 
+		// get 8bit framebuffer
 		pos=pos1=pos2=0;
 		ofs=fix_screeninfo.line_length-(var_screeninfo.xres);
 		for (y=0; y < var_screeninfo.yres; y+=1)
@@ -1316,10 +5676,11 @@ void getosd(unsigned char *osd, int *xres, int *yres)
 			for (x=0; x < var_screeninfo.xres; x+=1)
 			{
 				color = fb_page[pos2++];
-				osd[pos1++] = bl[color];
-				osd[pos1++] = gn[color];
-				osd[pos1++] = rd[color];
-				osd[pos1++] = tr[color];
+
+				osd[pos1++] = bl[color]; // b
+				osd[pos1++] = gn[color]; // g
+				osd[pos1++] = rd[color]; // r
+				osd[pos1++] = tr[color]; // tr
 			}
 			pos2+=ofs;
 		}
@@ -1333,1711 +5694,38 @@ void getosd(unsigned char *osd, int *xres, int *yres)
 		fprintf(stderr, "... Framebuffer-Size: %d x %d\n",*xres,*yres);
 }
 
-void getvideo2(unsigned char *video, int *xres, int *yres)
-{
-	char buf[256];
-	sprintf(buf, "/dev/dvb/adapter0/video%d", video_dev);
-	int fd_video = open(buf, O_RDONLY);
-	if (fd_video < 0) {
-		fprintf(stderr, "could not open %s\n", buf);
-		return;
-	}
-	ssize_t r = read(fd_video, video, 1920 * 1080 * 3);
-	(void)r;
-	close(fd_video);
-	*xres = 1920;
-	*yres = 1080;
-	return;
-}
-
-void getvideo(unsigned char *video, int *xres, int *yres)
-{
-	int mem_fd;
-	void *memory;
-	unsigned char *luma = NULL;
-	unsigned char *chroma = NULL;
-	unsigned char *memory_tmp = NULL;
-	int t;
-	int res = 0;
-	int stride = 0;
-	FILE *fp;
-	char buf[256];
-
-	if ((mem_fd = open("/dev/mem", O_RDWR|O_SYNC) ) < 0)
-	{
-		fprintf(stderr, "Mainmemory: can't open /dev/mem \n");
-		return;
-	}
-
-	if (stb_type > XILLEON)
-	{
-		const unsigned char* data = (unsigned char*)mmap(0, 100, PROT_READ, MAP_SHARED, mem_fd, registeroffset);
-		if(data == MAP_FAILED)
-		{
-			fprintf(stderr, "Mainmemory: <Memmapping failed 1>\n");
-			return;
-		}
-
-		off_t adr, adr2, ofs, ofs2, offset, pageoffset;
-		int xtmp,xsub,ytmp,t2,dat1;
-
-		if (stb_type == BRCM73565 || stb_type == BRCM73625 || stb_type == BRCM7439DAGS ||
-		    stb_type == BRCM7439 || stb_type == BRCM7252S ||
-		    stb_type == BRCM75845 || stb_type == BRCM72604) {
-			chr_luma_register_offset = 0x3c;
-			ofs = data[chr_luma_register_offset + 24] << 4;
-			ofs2 = data[chr_luma_register_offset + 28] << 4;
-			adr2 = (unsigned int)0 | data[chr_luma_register_offset + 3] << 24 | data[chr_luma_register_offset + 2] << 16 | data[chr_luma_register_offset + 1] << 8;
-			stride = data[0x19] << 8 | data[0x18];
-			adr = (unsigned int)0 | data[0x37] << 24 | data[0x36] << 16 | data[0x35] << 8;
-		} else {
-			ofs = data[chr_luma_register_offset + 8] << 4;
-			ofs2 = data[chr_luma_register_offset + 12] << 4;
-			adr2 = (unsigned int)0 | data[chr_luma_register_offset + 3] << 24 | data[chr_luma_register_offset + 2] << 16 | data[chr_luma_register_offset + 1] << 8;
-			stride = data[0x15] << 8 | data[0x14];
-			adr = (unsigned int)0 | data[0x1f] << 24 | data[0x1e] << 16 | data[0x1d] << 8;
-		}
-		offset = adr2 - adr;
-		pageoffset = adr & 0xfff;
-		adr -= pageoffset;
-		adr2 -= pageoffset;
-
-		munmap((void*)data, 100);
-
-		fp=fopen("/proc/stb/vmpeg/0/yres","r");
-		while (fgets(buf,sizeof(buf),fp))
-			sscanf(buf,"%x",&res);
-		fclose(fp);
-
-		if (!adr || !adr2)
-		{
-			*xres = stride;
-			*yres = res;
-			memset(video, 0, *xres * *yres * 3);
-			return;
-		}
-
-		luma = (unsigned char *)malloc(stride*(ofs));
-		chroma = (unsigned char *)malloc(stride * ofs2);
-
-		int memory_tmp_size = 0;
-		if (!mem2memdma_register)
-		{
-			memory_tmp_size = offset + (stride + chr_luma_stride) * ofs2;
-			if((memory_tmp = (unsigned char*)mmap(0, memory_tmp_size, PROT_READ, MAP_SHARED, mem_fd, adr)) == MAP_FAILED)
-			{
-				fprintf(stderr, "Mainmemory: <Memmapping failed 2>\n");
-				return;
-			}
-			usleep(50000);
-		}
-		else
-		{
-			int tmp_size = offset + (stride + chr_luma_stride) * ofs2;
-			if (tmp_size > 2 * DMA_BLOCKSIZE)
-			{
-				fprintf(stderr, "Got invalid stride value from the decoder: %d\n", stride);
-				return;
-			}
-			memory_tmp_size = DMA_BLOCKSIZE + 0x1000;
-			if ((memory_tmp = (unsigned char*)mmap(0, memory_tmp_size, PROT_READ|PROT_WRITE, MAP_SHARED, mem_fd, SPARE_RAM)) == MAP_FAILED)
-			{
-				fprintf(stderr, "Mainmemory: <Memmapping failed 3>\n");
-				return;
-			}
-			volatile unsigned long *mem_dma;
-			if ((mem_dma = (volatile unsigned long*)mmap(0, 0x1000, PROT_READ|PROT_WRITE, MAP_SHARED, mem_fd, mem2memdma_register)) == MAP_FAILED)
-			{
-				fprintf(stderr, "Mainmemory: <Memmapping failed 4>\n");
-				return;
-			}
-
-			int i = 0;
-			int tmp_len = DMA_BLOCKSIZE;
-			for (i=0; i < tmp_size; i += DMA_BLOCKSIZE)
-			{
-				unsigned long *descriptor = (void*)memory_tmp;
-				if (i + DMA_BLOCKSIZE > tmp_size)
-					tmp_len = tmp_size - i;
-				descriptor[0] = adr + i;
-				descriptor[1] = SPARE_RAM + 0x1000;
-				descriptor[2] = 0x40000000 | tmp_len;
-				descriptor[3] = 0;
-				descriptor[4] = 0;
-				descriptor[5] = 0;
-				descriptor[6] = 0;
-				descriptor[7] = 0;
-				mem_dma[1] = SPARE_RAM;
-				mem_dma[3] = 3;
-				mem_dma[2] = 1;
-				while (mem_dma[5] == 1)
-					usleep(2);
-				mem_dma[2] = 0;
-			}
-
-			munmap((void *)mem_dma, 0x1000);
-			munmap((void *)memory_tmp, 0x1000);
-			memory_tmp += 0x1000;
-			memory_tmp_size -= 0x1000;
-		}
-
-		t=t2=dat1=0;
-
-		for (xtmp=0; xtmp < stride; xtmp += chr_luma_stride)
-		{
-			if ((stride-xtmp) <= chr_luma_stride)
-				xsub=stride-xtmp;
-			else
-				xsub=chr_luma_stride;
-
-			dat1=xtmp;
-
-			for (ytmp = 0; ytmp < ofs; ytmp++)
-			{
-				if (stb_type == BRCM7439 || stb_type == BRCM7252S)
-				{
-					if (t & 0x100)
-					{
-						int cp = xsub % 0x20 ?: 0x20;
-						switch (xsub)
-						{
-							case 0x61 ... 0x80:
-								memcpy(luma + dat1 + 0x60, memory_tmp+pageoffset + t + 0x40, cp);
-								cp = 0x20;
-							case 0x41 ... 0x60:
-								memcpy(luma + dat1 + 0x40, memory_tmp+pageoffset + t + 0x60, cp);
-								cp = 0x20;
-							case 0x21 ... 0x40:
-								memcpy(luma + dat1 + 0x20, memory_tmp+pageoffset + t + 0x00, cp);
-								cp = 0x20;
-							default:
-								memcpy(luma + dat1 + 0x00, memory_tmp+pageoffset + t + 0x20, cp);
-						}
-					}
-					else
-					{
-						memcpy(luma+dat1,memory_tmp+pageoffset+t,xsub);
-					}
-				}
-				else if (stb_type == BRCM7439DAGS)
-				{
-					if (t & 0x200)
-					{
-						int cp = xsub % 0x20 ?: 0x20;
-						switch (xsub)
-						{
-							case 0xe1 ... 0x100:
-								memcpy(luma + dat1 + 0xe0, memory_tmp+pageoffset + t + 0xc0, cp);
-								cp = 0x20;
-							case 0xc1 ... 0xe0:
-								memcpy(luma + dat1 + 0xc0, memory_tmp+pageoffset + t + 0xe0, cp);
-								cp = 0x20;
-							case 0xa1 ... 0xc0:
-								memcpy(luma + dat1 + 0xa0, memory_tmp+pageoffset + t + 0x80, cp);
-								cp = 0x20;
-							case 0x81 ... 0xa0:
-								memcpy(luma + dat1 + 0x80, memory_tmp+pageoffset + t + 0xa0, cp);
-								cp = 0x20;
-							case 0x61 ... 0x80:
-								memcpy(luma + dat1 + 0x60, memory_tmp+pageoffset + t + 0x40, cp);
-								cp = 0x20;
-							case 0x41 ... 0x60:
-								memcpy(luma + dat1 + 0x40, memory_tmp+pageoffset + t + 0x60, cp);
-								cp = 0x20;
-							case 0x21 ... 0x40:
-								memcpy(luma + dat1 + 0x20, memory_tmp+pageoffset + t + 0x00, cp);
-								cp = 0x20;
-							default:
-								memcpy(luma + dat1 + 0x00, memory_tmp+pageoffset + t + 0x20, cp);
-						}
-					}
-					else
-					{
-						memcpy(luma+dat1,memory_tmp+pageoffset+t,xsub);
-					}
-				}
-				else if (stb_type == BRCM72604)
-				{
-					if (t & 0x200)
-					{
-						int cp = xsub % 0x20 ?: 0x20;
-						switch (xsub)
-						{
-							case 0xe1 ... 0x100:
-								memcpy(luma + dat1 + 0xe0, memory_tmp+pageoffset + t + 0xc0, cp);
-								cp = 0x20;
-							case 0xc1 ... 0xe0:
-								memcpy(luma + dat1 + 0xc0, memory_tmp+pageoffset + t + 0xe0, cp);
-								cp = 0x20;
-							case 0xa1 ... 0xc0:
-								memcpy(luma + dat1 + 0xa0, memory_tmp+pageoffset + t + 0x80, cp);
-								cp = 0x20;
-							case 0x81 ... 0xa0:
-								memcpy(luma + dat1 + 0x80, memory_tmp+pageoffset + t + 0xa0, cp);
-								cp = 0x20;
-							case 0x61 ... 0x80:
-								memcpy(luma + dat1 + 0x60, memory_tmp+pageoffset + t + 0x40, cp);
-								cp = 0x20;
-							case 0x41 ... 0x60:
-								memcpy(luma + dat1 + 0x40, memory_tmp+pageoffset + t + 0x60, cp);
-								cp = 0x20;
-							case 0x21 ... 0x40:
-								memcpy(luma + dat1 + 0x20, memory_tmp+pageoffset + t + 0x00, cp);
-								cp = 0x20;
-							default:
-								memcpy(luma + dat1 + 0x00, memory_tmp+pageoffset + t + 0x20, cp);
-						}
-					}
-					else
-					{
-						memcpy(luma+dat1,memory_tmp+pageoffset+t,xsub);
-					}
-
-					int ii;
-					unsigned char luma_tmp[0x100];
-
-					for (ii = 0; ii < 0x100; ii+= 0x20) {
-						memcpy(&luma_tmp[ii + 0x00], luma + dat1 + (ii + 0x1c), 0x4);
-						memcpy(&luma_tmp[ii + 0x04], luma + dat1 + (ii + 0x18), 0x4);
-						memcpy(&luma_tmp[ii + 0x08], luma + dat1 + (ii + 0x14), 0x4);
-						memcpy(&luma_tmp[ii + 0x0c], luma + dat1 + (ii + 0x10), 0x4);
-						memcpy(&luma_tmp[ii + 0x10], luma + dat1 + (ii + 0x0c), 0x4);
-						memcpy(&luma_tmp[ii + 0x14], luma + dat1 + (ii + 0x08), 0x4);
-						memcpy(&luma_tmp[ii + 0x18], luma + dat1 + (ii + 0x04), 0x4);
-						memcpy(&luma_tmp[ii + 0x1c], luma + dat1 + (ii + 0x00), 0x4);
-					}
-					memcpy(luma + dat1, luma_tmp, xsub);
-				}
-				else
-				{
-					memcpy(luma+dat1,memory_tmp+pageoffset+t,xsub);
-				}
-
-				if ((int)(ofs2 - ytmp) > 0)
-				{
-					if (stb_type == BRCM7439 || stb_type == BRCM7252S)
-					{
-						if (t2 & 0x100)
-						{
-							int cp = xsub % 0x20 ?: 0x20;
-							switch (xsub)
-							{
-								case 0x61 ... 0x80:
-									memcpy(chroma + dat1 + 0x60,memory_tmp+pageoffset+offset + t2 + 0x40, cp);
-									cp = 0x20;
-								case 0x41 ... 0x60:
-									memcpy(chroma + dat1 + 0x40, memory_tmp+pageoffset+offset + t2 + 0x60, cp);
-									cp = 0x20;
-								case 0x21 ... 0x40:
-									memcpy(chroma + dat1 + 0x20, memory_tmp+pageoffset+offset + t2 + 0x00, cp);
-									cp = 0x20;
-								default:
-									memcpy(chroma + dat1 + 0x00, memory_tmp+pageoffset+offset + t2 + 0x20, cp);
-							}
-						}
-						else
-						{
-							memcpy(chroma+dat1,memory_tmp+pageoffset+offset+t2,xsub);
-						}
-					}
-					else if (stb_type == BRCM7439DAGS)
-					{
-						if (t2 & 0x200)
-						{
-							int cp = xsub % 0x20 ?: 0x20;
-							switch (xsub)
-							{
-								case 0xe1 ... 0x100:
-									memcpy(chroma + dat1 + 0xe0,memory_tmp+pageoffset+offset + t2 + 0xc0, cp);
-									cp = 0x20;
-								case 0xc1 ... 0xe0:
-									memcpy(chroma + dat1 + 0xc0,memory_tmp+pageoffset+offset + t2 + 0xe0, cp);
-									cp = 0x20;
-								case 0xa1 ... 0xc0:
-									memcpy(chroma + dat1 + 0xa0,memory_tmp+pageoffset+offset + t2 + 0x80, cp);
-									cp = 0x20;
-								case 0x81 ... 0xa0:
-									memcpy(chroma + dat1 + 0x80,memory_tmp+pageoffset+offset + t2 + 0xa0, cp);
-									cp = 0x20;
-								case 0x61 ... 0x80:
-									memcpy(chroma + dat1 + 0x60,memory_tmp+pageoffset+offset + t2 + 0x40, cp);
-									cp = 0x20;
-								case 0x41 ... 0x60:
-									memcpy(chroma + dat1 + 0x40, memory_tmp+pageoffset+offset + t2 + 0x60, cp);
-									cp = 0x20;
-								case 0x21 ... 0x40:
-									memcpy(chroma + dat1 + 0x20, memory_tmp+pageoffset+offset + t2 + 0x00, cp);
-									cp = 0x20;
-								default:
-									memcpy(chroma + dat1 + 0x00, memory_tmp+pageoffset+offset + t2 + 0x20, cp);
-							}
-						}
-						else
-						{
-							memcpy(chroma+dat1,memory_tmp+pageoffset+offset+t2,xsub);
-						}
-					}
-					else if (stb_type == BRCM72604)
-					{
-						if (t2 & 0x200)
-						{
-							int cp = xsub % 0x20 ?: 0x20;
-							switch (xsub)
-							{
-								case 0xe1 ... 0x100:
-									memcpy(chroma + dat1 + 0xe0,memory_tmp+pageoffset+offset + t2 + 0xc0, cp);
-									cp = 0x20;
-								case 0xc1 ... 0xe0:
-									memcpy(chroma + dat1 + 0xc0,memory_tmp+pageoffset+offset + t2 + 0xe0, cp);
-									cp = 0x20;
-								case 0xa1 ... 0xc0:
-									memcpy(chroma + dat1 + 0xa0,memory_tmp+pageoffset+offset + t2 + 0x80, cp);
-									cp = 0x20;
-								case 0x81 ... 0xa0:
-									memcpy(chroma + dat1 + 0x80,memory_tmp+pageoffset+offset + t2 + 0xa0, cp);
-									cp = 0x20;
-								case 0x61 ... 0x80:
-									memcpy(chroma + dat1 + 0x60,memory_tmp+pageoffset+offset + t2 + 0x40, cp);
-									cp = 0x20;
-								case 0x41 ... 0x60:
-									memcpy(chroma + dat1 + 0x40,memory_tmp+pageoffset+offset + t2 + 0x60, cp);
-									cp = 0x20;
-								case 0x21 ... 0x40:
-									memcpy(chroma + dat1 + 0x20, memory_tmp+pageoffset+offset + t2 + 0x00, cp);
-									cp = 0x20;
-								default:
-									memcpy(chroma + dat1 + 0x00,memory_tmp+pageoffset+offset + t2 + 0x20, cp);
-							}
-						}
-						else
-						{
-							memcpy(chroma+dat1,memory_tmp+pageoffset+offset+t2,xsub);
-						}
-
-						int ii;
-						unsigned char chroma_tmp[0x100];
-
-						for (ii = 0; ii < 0x100; ii+= 0x20) {
-							memcpy(&chroma_tmp[ii + 0x00], chroma + dat1 + (ii + 0x1c), 0x4);
-							memcpy(&chroma_tmp[ii + 0x04], chroma + dat1 + (ii + 0x18), 0x4);
-							memcpy(&chroma_tmp[ii + 0x08], chroma + dat1 + (ii + 0x14), 0x4);
-							memcpy(&chroma_tmp[ii + 0x0c], chroma + dat1 + (ii + 0x10), 0x4);
-							memcpy(&chroma_tmp[ii + 0x10], chroma + dat1 + (ii + 0x0c), 0x4);
-							memcpy(&chroma_tmp[ii + 0x14], chroma + dat1 + (ii + 0x08), 0x4);
-							memcpy(&chroma_tmp[ii + 0x18], chroma + dat1 + (ii + 0x04), 0x4);
-							memcpy(&chroma_tmp[ii + 0x1c], chroma + dat1 + (ii + 0x00), 0x4);
-						}
-						memcpy(chroma + dat1, chroma_tmp, xsub);
-					}
-					else
-					{
-						memcpy(chroma+dat1,memory_tmp+pageoffset+offset+t2,xsub);
-					}
-
-					t2 += chr_luma_stride;
-				}
-
-				t += chr_luma_stride;
-				dat1 += stride;
-			}
-		}
-		munmap(memory_tmp, memory_tmp_size);
-
-		int count = (stride*ofs) >> 2;
-		#pragma omp parallel for
-		for (t = 0; t < count; ++t)
-		{
-			unsigned char* p = luma + (4 * t);
-			unsigned char tt;
-			SWAP(p[0], p[3]);
-			SWAP(p[1], p[2]);
-		}
-		count = (stride*ofs2) >> 2;
-		#pragma omp parallel for
-		for (t = 0; t < count; ++t)
-		{
-			unsigned char* p = chroma + (4 * t);
-			unsigned char tt;
-			SWAP(p[0], p[3]);
-			SWAP(p[1], p[2]);
-		}
-	}
-	else if (stb_type == DMNEW)
-	{
-#define VIDEOGRABBER_IOC_MAGIC			'D'
-#define VIDEOGRABBER_IOC_SETUP			_IOW(VIDEOGRABBER_IOC_MAGIC, 0x00, struct videograbber_setup_t)
-#define VIDEOGRABBER_IOC_GET_FRAME		_IOR(VIDEOGRABBER_IOC_MAGIC, 0x01, struct videograbber_vframe_t)
-
-		*xres=0;
-		*yres=0;
-
-		int width = 1280;
-		int height = 720;
-		int aspect = 0x90;
-
-		readIntFromFile("/sys/class/video/frame_width", 10, &width);
-		readIntFromFile("/sys/class/video/frame_height", 10, &height);
-		readIntFromFile("/sys/class/video/frame_aspect_ratio", 16, &aspect);
-
-		if (width <= 0 || height <= 0) { width = 1280; height = 720; }
-		width = zoomWidth(width, height, aspect);
-		if (width <= 0) width = 1280;
-
-		int fd = -1;
-		void *srcAddr = MAP_FAILED;
-		size_t mapLength = 0;
-
-		fd = open("/dev/videograbber", O_RDWR);
-		if (fd < 0) { fprintf(stderr, "videograbber: failed to open device (%m)\n"); return; }
-
-		struct videograbber_setup_t setup = { 0 };
-		setup.out_width = width;
-		setup.out_height = height;
-		setup.out_stride = width * 3;
-		setup.out_format = VIDEOGRABBER_FORMAT_RGB888;
-		if (ioctl(fd, VIDEOGRABBER_IOC_SETUP, &setup) < 0)
-		{ fprintf(stderr, "getvideo: can't setup videograbber (%m)\n"); goto dmerr; }
-
-		struct videograbber_vframe_t vf;
-		memset(&vf, 0, sizeof(vf));
-		if (ioctl(fd, VIDEOGRABBER_IOC_GET_FRAME, &vf) != 0)
-		{ fprintf(stderr, "getvideo: can't get current frame (%m)\n"); goto dmerr; }
-
-		const int bytes_per_pixel = 3;
-		const size_t packed_stride = (size_t)vf.width[0] * (size_t)bytes_per_pixel;
-		const size_t source_stride = (size_t)vf.stride[0];
-		mapLength = source_stride * (size_t)vf.height[0];
-
-		if (vf.width[0] <= 0 || vf.height[0] <= 0 || source_stride < packed_stride || mapLength == 0)
-		{
-			fprintf(stderr, "getvideo: invalid frame geometry width=%d height=%d stride=%d packed_stride=%zu\n",
-			        vf.width[0], vf.height[0], vf.stride[0], packed_stride);
-			goto dmerr;
-		}
-
-		srcAddr = mmap(NULL, mapLength, PROT_READ, MAP_SHARED, fd, (off_t)vf.canvas_phys_addr[0]);
-		if (srcAddr == MAP_FAILED)
-		{ fprintf(stderr, "getvideo: error while mapping src buffer (%m)\n"); goto dmerr; }
-
-		for (int y = 0; y < vf.height[0]; y++)
-			memcpy(video + ((size_t)y * packed_stride),
-			       (const unsigned char *)srcAddr + ((size_t)y * source_stride),
-			       packed_stride);
-
-		*xres = vf.width[0];
-		*yres = vf.height[0];
-
-dmerr:
-		if (srcAddr != MAP_FAILED) munmap(srcAddr, mapLength);
-		if (fd >= 0) close(fd);
-		return;
-	}
-	else if (stb_type == WETEK)
-	{
-#define AMVIDEOCAP_IOC_MAGIC  'V'
-#define AMVIDEOCAP_IOW_SET_START_CAPTURE _IOW(AMVIDEOCAP_IOC_MAGIC, 0x32, int)
-		int fd;
-		char *mbuf;
-
-		*xres=0;
-		*yres=0;
-
-		fp = fopen("/proc/stb/vmpeg/0/xres","r");
-		if (fp) { while (fgets(buf,sizeof(buf),fp)) sscanf(buf,"%x",&stride); fclose(fp); }
-		fp = fopen("/proc/stb/vmpeg/0/yres","r");
-		if (fp) { while (fgets(buf,sizeof(buf),fp)) sscanf(buf,"%x",&res); fclose(fp); }
-
-		if ((stride == 0) || (res == 0)) return;
-
-		fd = open("/dev/amvideocap0", O_RDWR);
-		if (fd < 0) return;
-
-		ioctl(fd, AMVIDEOCAP_IOW_SET_START_CAPTURE, 10000);
-		mbuf = mmap(NULL, stride * res * 3, PROT_READ, MAP_SHARED, fd, 0);
-		if(mbuf == MAP_FAILED) { close(fd); fprintf(stderr, "Mainmemory: <Memmapping failed 5>\n"); return; }
-		memcpy(video, mbuf, stride * res * 3);
-		munmap(mbuf, stride * res * 3);
-		close(fd);
-		*xres=stride;
-		*yres=res;
-		return;
-	}
-	else if (stb_type == AZBOX863x || stb_type == AZBOX865x)
-	{
-		unsigned char *infos = 0, *ptr;
-		int fd, len = 0, x, y;
-		unsigned int chroma_w, chroma_h, luma_w, luma_h, luma_width, chroma_width;
-		unsigned int luma_size_tile, chroma_size_tile;
-		unsigned char *pluma, *pchroma;
-
-		fd = open("/dev/frameyuv",O_RDWR);
-		if(!fd) { perror("/dev/frameyuv"); return; }
-
-		infos = malloc(1920*1080*4);
-		len = read(fd,infos,1920*1080*4);
-
-		if(len <= 0 ) {
-			fprintf(stderr,"No picture info %d\n",len);
-			free(infos);
-			close(fd);
-			return;
-		}
-
-		luma_w = (infos[0]<<24) | (infos[1]<<16) | (infos[2]<<8) | (infos[3]);
-		luma_h = (infos[4]<<24) | (infos[5]<<16) | (infos[6]<<8) | (infos[7]);
-		luma_width = (infos[8]<<24) | (infos[9]<<16) | (infos[10]<<8) | (infos[11]);
-		chroma_w = (infos[12]<<24) | (infos[13]<<16) | (infos[14]<<8) | (infos[15]);
-		chroma_h = (infos[16]<<24) | (infos[17]<<16) | (infos[18]<<8) | (infos[19]);
-		chroma_width = (infos[20]<<24) | (infos[21]<<16) | (infos[22]<<8) | (infos[23]);
-
-		if (stb_type == AZBOX863x) {
-			luma_size_tile = (((luma_w + 127)/128)*128) * (((luma_h + 31)/32)*32);
-			chroma_size_tile = (((chroma_w + 127)/128)*128) * (((chroma_h + 31)/32)*32);
-		} else {
-			luma_size_tile = (((luma_w + 255)/256)*256) * (((luma_h + 31)/32)*32);
-			chroma_size_tile = (((chroma_w + 255)/256)*256) * (((chroma_h + 31)/32)*32);
-		}
-
-		pluma = infos + 24;
-		pchroma = infos + 24 + luma_size_tile;
-
-		luma = (unsigned char *)malloc(luma_w * luma_h);
-		chroma = (unsigned char *)malloc(chroma_w * chroma_h * 2);
-
-		stride = luma_w;
-		res = luma_h;
-
-		ptr = luma;
-		if (stb_type == AZBOX863x) {
-			for (y = 0; y < luma_h; y++)
-				for (x = 0; x < luma_w; x++) {
-					unsigned char* pixel = (pluma + (x/128) * 4096 + (y/32) * luma_width * 32 + (x % 128) + (y % 32)*128);
-					*ptr++ = *pixel;
-				}
-			ptr = chroma;
-			for (y = 0; y < chroma_h; y++)
-				for (x = 0; x < chroma_w*2; x++) {
-					unsigned char* pixel = (pchroma + (x/128) * 4096 + (y/32) * chroma_width * 32 + (x % 128) + (y % 32)*128);
-					*ptr++ = *pixel;
-				}
-		} else if (stb_type == AZBOX865x) {
-			for (y = 0; y < luma_h; y++)
-				for (x = 0; x < luma_w; x++) {
-					unsigned char* pixel = (pluma + (x/256) * 8192 + (y/32) * luma_width * 32 + (x % 256) + (y % 32)*256);
-					*ptr++ = *pixel;
-				}
-			ptr = chroma;
-			for (y = 0; y < chroma_h; y++)
-				for (x = 0; x < chroma_w*2; x++) {
-					unsigned char* pixel = (pchroma + (x/256) * 8192 + (y/32) * chroma_width * 32 + (x % 256) + (y % 32)*256);
-					*ptr++ = *pixel;
-				}
-		}
-		free(infos);
-		close(fd);
-	}
-#if defined(__sh__)
-	else if (stb_type == ST)
-	{
-		int yblock, xblock, iyblock, ixblock, yblockoffset, offset, layer_offset, OUTITER, OUTINC, OUTITERoffset;
-		int stride_half;
-		unsigned char *out;
-		unsigned char even, cr;
-		int fd_bpa;
-		int ioctlres;
-		BPAMemMapMemData bpa_data;
-		char bpa_mem_device[30];
-		char *decode_surface;
-		int delay;
-
-		*xres=0;
-		*yres=0;
-
-		fp = fopen("/proc/stb/vmpeg/0/xres","r");
-		if (fp) { while (fgets(buf,sizeof(buf),fp)) sscanf(buf,"%x",&stride); fclose(fp); }
-		fp = fopen("/proc/stb/vmpeg/0/yres","r");
-		if (fp) { while (fgets(buf,sizeof(buf),fp)) sscanf(buf,"%x",&res); fclose(fp); }
-
-		if((stride == 0)&&(res == 0)) return;
-
-		fd_bpa = open("/dev/bpamem0", O_RDWR);
-		if(fd_bpa < 0) { fprintf(stderr, "cannot access /dev/bpamem0! err = %d\n", fd_bpa); return; }
-		bpa_data.bpa_part  = "LMI_VID";
-		bpa_data.phys_addr = 0x00000000;
-		bpa_data.mem_size = 0;
-
-		fp = fopen("/proc/bpa2","r");
-		if (fp) {
-			unsigned char found_part = 0;
-			unsigned long mem_size = 0, phys_addr = 0;
-			while (fgets(buf,sizeof(buf),fp)) {
-				if(found_part || strstr(buf, bpa_data.bpa_part) != NULL) {
-					found_part = 1;
-					if (sscanf(buf, "- %lu B at %lx", &mem_size, &phys_addr) == 2)
-						if(mem_size > bpa_data.mem_size) {
-							bpa_data.mem_size  = mem_size;
-							bpa_data.phys_addr = phys_addr;
-						}
-				}
-			}
-			fclose(fp);
-		}
-		printf("Using bpa2 part %s - 0x%lx %lu\n", bpa_data.bpa_part, bpa_data.phys_addr, bpa_data.mem_size);
-		ioctlres = ioctl(fd_bpa, BPAMEMIO_MAPMEM, &bpa_data);
-		if(ioctlres) { fprintf(stderr, "cannot map required mem\n"); return; }
-		sprintf(bpa_mem_device, "/dev/bpamem%d", bpa_data.device_num);
-		close(fd_bpa);
-		fd_bpa = open(bpa_mem_device, O_RDWR);
-		if(fd_bpa < 0) { fprintf(stderr, "cannot access %s! err = %d\n", bpa_mem_device, fd_bpa); return; }
-
-		char *decode_map = (char *)mmap(0, bpa_data.mem_size, PROT_WRITE|PROT_READ, MAP_SHARED, fd_bpa, 0);
-		if(decode_map == MAP_FAILED) { fprintf(stderr, "could not map bpa mem\n"); close(fd_bpa); return; }
-		fprintf(stderr, "decode surface size:  %d\n", bpa_data.mem_size );
-
-		stride_half = stride / 2;
-
-		luma   = (unsigned char *)malloc(stride * res);
-		chroma = (unsigned char *)malloc(stride * res / 2);
-		char *temp = (unsigned char *)malloc(4 * 1024 * 1024);
-		if( NULL == temp ) { printf("can not allocate memory\n"); return; }
-
-		memset(chroma, 0x80, stride * res / 2);
-		memset(luma, 0x00, stride * res);
-		memset(temp, 0x00, 4 * 1024 * 1024);
-
-		layer_offset = 0;
-		yblock = res/16;
-		xblock = stride/16;
-		yblockoffset = xblock * 256 * 2;
-
-		OUTITER       = 0;
-		OUTITERoffset = 0;
-		OUTINC        = 1;
-		out           = luma;
-
-		struct timeval start_tv, stop_tv, result_tv;
-		{
-			unsigned char old_frame[0x800];
-			memcpy(old_frame, decode_map, 0x800);
-			gettimeofday(&start_tv, NULL);
-			memcmp(decode_map, old_frame, 0x800);
-			gettimeofday(&stop_tv, NULL);
-			for(delay = 0; delay < 500; delay++) {
-				if (memcmp(decode_map, old_frame, 0x800) != 0) break;
-				usleep(100);
-			}
-		}
-		memcpy(temp,decode_map,4*1024*1024);
-		decode_surface = temp;
-
-		for(even = 0; even < 2; even++) {
-			offset        = layer_offset + (even  << 8);
-			OUTITERoffset = even * xblock << 8;
-			for (iyblock = even; iyblock < yblock; iyblock+=2)
-				for (ixblock = 0; ixblock < xblock; ixblock++) {
-					int line;
-					OUTITER = OUTITERoffset;
-					for (line = 0; line < 16; line++) { OUT_LU_16(offset, line); OUTITER += (stride - 16); }
-					offset += 0x200;
-					OUTITERoffset += 16;
-				}
-				OUTITERoffset += (stride << 5) - stride;
-		}
-
-		layer_offset = ((stride*res + (yblockoffset >> 1)) / yblockoffset) * yblockoffset;
-		yblock = res >> 4;
-		xblock = stride_half >> 3;
-		yblockoffset = (((xblock + 1) >> 1) << 1) << 8;
-
-		OUTITER       = 0;
-		OUTITERoffset = 0;
-		OUTINC        = 2;
-		out           = chroma;
-
-		for(cr = 0; cr < 2; cr++)
-			for(even = 0; even < 2; even++) {
-				offset        = layer_offset + (even  << 8);
-				OUTITERoffset = even * (xblock << 7) + cr;
-				for (iyblock = even; iyblock < yblock; iyblock+=2)
-					for (ixblock = 0; ixblock < xblock; ixblock++) {
-						int line;
-						OUTITER = OUTITERoffset;
-						for (line = 0; line < 8; line++) { OUT_CH_8(offset, line, !cr); OUTITER += (stride - 16); }
-						offset += (offset%0x100?0x180:0x80);
-						OUTITERoffset += 16;
-					}
-					OUTITERoffset += (stride << 4) - stride;
-			}
-		timeval_subtract(&result_tv,&stop_tv,&start_tv);
-		printf("framesync after:     %dms\n", delay);
-		printf("frame copy duration: %fms\n", (((float)result_tv.tv_sec)*1000.0f+((float)result_tv.tv_usec)/1000.0f));
-
-		munmap(decode_map, bpa_data.mem_size);
-		ioctlres = ioctl(fd_bpa, BPAMEMIO_UNMAPMEM);
-		if(ioctlres) { fprintf(stderr, "cannot unmap required mem\n"); close(fd_bpa); return; }
-		close(fd_bpa);
-	}
-#endif
-	else if (stb_type == XILLEON)
-	{
-		fp = fopen("/proc/stb/vmpeg/0/xres","r");
-		if (fp) { while (fgets(buf,sizeof(buf),fp)) sscanf(buf,"%x",&stride); fclose(fp); }
-		fp = fopen("/proc/stb/vmpeg/0/yres","r");
-		if (fp) { while (fgets(buf,sizeof(buf),fp)) sscanf(buf,"%x",&res); fclose(fp); }
-
-		if((memory = (unsigned char*)mmap(0, 1920*1152*6, PROT_READ, MAP_SHARED, mem_fd, 0x6000000)) == MAP_FAILED)
-		{ fprintf(stderr, "Mainmemory: <Memmapping failed 6>\n"); return; }
-
-		luma = (unsigned char *)malloc(1920*1152);
-		chroma = (unsigned char *)malloc(1920*576);
-
-		int offset=1920*1152*5;
-		const unsigned char* frame_l = memory;
-		const unsigned char* frame_c = memory + offset;
-
-		int xtmp,ytmp,ysub,xsub;
-		const int ypart=32;
-		const int xpart=128;
-		int ysubcount=res/32;
-
-		for (ysub=0; ysub<=ysubcount; ysub++) {
-			for (xsub=0; xsub<15; xsub++)
-				for (ytmp=0; ytmp<ypart; ytmp++) {
-					int extraoffset = (stride*(ytmp+(ysub*ypart)));
-					int destx = xsub*xpart;
-					int overflow = (destx + xpart) - stride;
-					if (overflow <= 0) memcpy(luma + destx + extraoffset, frame_l, xpart);
-					else if (overflow < xpart) memcpy(luma + destx + extraoffset, frame_l, overflow);
-					frame_l += xpart;
-				}
-			++ysub;
-			for (xsub=0; xsub<15; xsub++)
-				for (ytmp=0; ytmp<ypart; ytmp++) {
-					int extraoffset = (stride*(ytmp+(ysub*ypart)));
-					int destx = xsub*xpart;
-					int overflow = (destx + xpart) - stride;
-					if (overflow <= 0) {
-						memcpy(luma + destx + extraoffset + 64, frame_l, 64);
-						memcpy(luma + destx + extraoffset, frame_l + 64, 64);
-					} else if (overflow < xpart) {
-						if (overflow > 64) {
-							memcpy(luma + destx + extraoffset + 64, frame_l, overflow-64);
-							memcpy(luma + destx + extraoffset, frame_l + 64, 64);
-						} else memcpy(luma + destx + extraoffset, frame_l + 64, overflow);
-					}
-					frame_l += xpart;
-				}
-		}
-
-		ysubcount /= 2;
-		for (ysub=0; ysub<=ysubcount; ysub++) {
-			for (xsub=0; xsub<15; xsub++)
-				for (ytmp=0; ytmp<ypart; ytmp++) {
-					int extraoffset = (stride*(ytmp+(ysub*ypart)));
-					int destx = xsub*xpart;
-					int overflow = (destx + xpart) - stride;
-					if (overflow <= 0) memcpy(chroma + destx + extraoffset, frame_c, xpart);
-					else if (overflow < xpart) memcpy(chroma + destx + extraoffset, frame_c, overflow);
-					frame_c += xpart;
-				}
-			++ysub;
-			for (xsub=0; xsub<15; xsub++)
-				for (ytmp=0; ytmp<ypart; ytmp++) {
-					int extraoffset = (stride*(ytmp+(ysub*ypart)));
-					int destx = xsub*xpart;
-					int overflow = (destx + xpart) - stride;
-					if (overflow <= 0) {
-						memcpy(chroma + destx + extraoffset + 64, frame_c, 64);
-						memcpy(chroma + destx + extraoffset, frame_c + 64, 64);
-					} else if (overflow < xpart) {
-						if (overflow > 64) {
-							memcpy(chroma + destx + extraoffset + 64, frame_c, overflow-64);
-							memcpy(chroma + destx + extraoffset, frame_c + 64, 64);
-						} else memcpy(chroma + destx + extraoffset, frame_c + 64, overflow);
-					}
-					frame_c += xpart;
-				}
-		}
-		munmap(memory, 1920*1152*6);
-	}
-	else if (stb_type == VULCAN || stb_type == PALLAS)
-	{
-		memory_tmp = (unsigned char *)malloc(720 * 576 * 3 + 16);
-		int fd_video = open(VIDEO_DEV, O_RDONLY);
-		if (fd_video < 0) { fprintf(stderr, "could not open /dev/video"); return; }
-		int r = read(fd_video, memory_tmp, 720 * 576 * 3 + 16);
-		if (r < 16) { fprintf(stderr, "read failed\n"); close(fd_video); return; }
-		close(fd_video);
-		int *size = (int*)memory_tmp;
-		stride = size[0];
-		res = size[1];
-		luma = (unsigned char *)malloc(stride * res);
-		chroma = (unsigned char *)malloc(stride * res);
-		memcpy (luma, memory_tmp + 16, stride * res);
-		memcpy (chroma, memory_tmp + 16 + stride * res, stride * res);
-		free(memory_tmp);
-	}
-
-	close(mem_fd);
-
-	const size_t max_video_pixels = stb_supports_uhd_grab_buffers() ? 3840U * 2160U : 1920U * 1080U;
-	if (stride <= 0 || res <= 0 || (size_t)stride > max_video_pixels / (size_t)res)
-	{
-		fprintf(stderr, "getvideo: refusing unsafe frame geometry %dx%d for allocated buffers\n", stride, res);
-		free(luma);
-		free(chroma);
-		return;
-	}
-
-	const int rgbstride = stride * 3;
-	const int scans = res / 2;
-	int y;
-	#pragma omp parallel for
-	for (y=0; y < scans; ++y)
-	{
-		int x;
-		int out1 = y * rgbstride * 2;
-		int pos = y * stride * 2;
-		const unsigned char* chroma_p = chroma + (y * stride);
-
-		for (x=stride; x != 0; x-=2)
-		{
-			int U = *chroma_p++;
-			int V = *chroma_p++;
-
-			int RU=yuv2rgbtable_ru[U];
-			int GU=yuv2rgbtable_gu[U];
-			int GV=yuv2rgbtable_gv[V];
-			int BV=yuv2rgbtable_bv[V];
-
-			switch (stb_type) { case XILLEON: SWAP(RU,BV); break; }
-
-			int Y=yuv2rgbtable_y[luma[pos]];
-			video[out1]=CLAMP((Y + RU)>>16);
-			video[out1+1]=CLAMP((Y - GV - GU)>>16);
-			video[out1+2]=CLAMP((Y + BV)>>16);
-
-			Y=yuv2rgbtable_y[luma[stride+pos]];
-			video[out1+rgbstride]=CLAMP((Y + RU)>>16);
-			video[out1+1+rgbstride]=CLAMP((Y - GV - GU)>>16);
-			video[out1+2+rgbstride]=CLAMP((Y + BV)>>16);
-
-			pos++;
-			out1+=3;
-
-			Y=yuv2rgbtable_y[luma[pos]];
-			video[out1]=CLAMP((Y + RU)>>16);
-			video[out1+1]=CLAMP((Y - GV - GU)>>16);
-			video[out1+2]=CLAMP((Y + BV)>>16);
-
-			Y=yuv2rgbtable_y[luma[stride+pos]];
-			video[out1+rgbstride]=CLAMP((Y + RU)>>16);
-			video[out1+1+rgbstride]=CLAMP((Y - GV - GU)>>16);
-			video[out1+2+rgbstride]=CLAMP((Y + BV)>>16);
-
-			out1+=3;
-			pos++;
-		}
-	}
-
-	*xres=stride;
-	*yres=res;
-	free(luma);
-	free(chroma);
-}
-
-int main(int argc, char **argv)
-{
-	int xres_v = 0, yres_v = 0, xres_o = 0, yres_o = 0, xres = 0, yres = 0, aspect;
-	int c,osd_only,video_only,use_osd_res,width,use_png,use_jpg,jpg_quality,no_aspect,use_letterbox,use_ffmpeg_video_backend;
-
-	resize = &fast_resize;
-
-	osd_only=video_only=use_osd_res=width=use_png=use_jpg=no_aspect=use_letterbox=use_ffmpeg_video_backend=0;
-	jpg_quality=50;
-	aspect=1;
-
-	int dst_left = 0, dst_top = 0, dst_width = 0, dst_height = 0;
-	int vbuf_w = 0, vbuf_h = 0;
-	int dst_is_osd_pixels = 0;
-	int aml_axis_active   = 0;
-	int axis_debug        = 0;
-
-	if (getenv("GRAB_AXIS_DEBUG") && *getenv("GRAB_AXIS_DEBUG"))
-		axis_debug = 1;
-
-	unsigned char *video, *osd, *output;
-	int output_bytes=3;
-	int hisi_composited_all = 0;
-
-	const char* filename = "/tmp/screenshot.bmp";
-
-	char buf[256];
-	FILE *fp = fopen("/proc/fb","r");
-	if (!fp)
-	{
-		fprintf(stderr, "No framebuffer, unknown STB .. quit.\n");
-		return 1;
-	}
-
-	while (fgets(buf,sizeof(buf),fp))
-	{
-		if (strcasestr(buf,"VULCAN")) stb_type=VULCAN;
-		if (strcasestr(buf,"PALLAS")) stb_type=PALLAS;
-		if (strcasestr(buf,"XILLEON")) stb_type=XILLEON;
-		if (strcasestr(buf,"EM863x")) stb_type=AZBOX863x;
-		if (strcasestr(buf,"EM865x")) stb_type=AZBOX865x;
-#if defined(__sh__)
-		if (strcasestr(buf,"STi") || strcasestr(buf,"STx")) stb_type=ST;
-#endif
-	}
-	fclose(fp);
-
-	if (stb_type == UNKNOWN)
-	{
-		FILE *file = fopen("/proc/stb/info/vumodel", "r");
-		if (file)
-		{
-			char b[32];
-			while (fgets(b, sizeof(b), file))
-				if (strcasestr(b,"zero4k")) { stb_type = BRCM72604VU; break; }
-			fclose(file);
-		}
-	}
-
-	if (stb_type == UNKNOWN)
-	{
-		FILE *file = fopen("/proc/stb/info/boxtype", "r");
-		if (file)
-		{
-			char b[32];
-			while (fgets(b, sizeof(b), file))
-				if (strcasestr(b,"osmio4k")) { stb_type = BRCM72604VU; break; }
-			fclose(file);
-		}
-	}
-
-	if (stb_type == UNKNOWN)
-	{
-		FILE *file = fopen("/proc/stb/info/hwmodel", "r");
-		if (file)
-		{
-			char b[32];
-			while (fgets(b, sizeof(b), file))
-			{
-				if (strcasestr(b,"force3")) { stb_type = BRCM7439DAGS; break; }
-				if (strcasestr(b,"force3se")) { stb_type = BRCM7439DAGS; break; }
-				if (strcasestr(b,"force3uhd")) { stb_type = BRCM7439DAGS; break; }
-				if (strcasestr(b,"force3uhdplus")) { stb_type = BRCM7439DAGS; break; }
-				if (strcasestr(b,"tmtwin4k")) { stb_type = BRCM7439DAGS; break; }
-				if (strcasestr(b,"revo4k")) { stb_type = BRCM7439DAGS; break; }
-				if (strcasestr(b,"galaxy4k")) { stb_type = BRCM7439DAGS; break; }
-				if (strcasestr(b,"tm4ksuper")) { stb_type = BRCM7439DAGS; break; }
-				if (strcasestr(b,"lunix3-4k")) { stb_type = BRCM7439DAGS; break; }
-				if (strcasestr(b,"valalinux4k")) { stb_type = BRCM7439DAGS; break; }
-			}
-			fclose(file);
-		}
-	}
-
-	if (stb_type == UNKNOWN)
-	{
-		FILE *file = fopen("/proc/stb/info/chipset", "r");
-		if (file)
-		{
-			char b[32];
-			while (fgets(b, sizeof(b), file))
-			{
-				if (strstr(b,"7400")) { stb_type = BRCM7400; break; }
-				else if (strstr(b,"7401")) { stb_type = BRCM7401; break; }
-				else if (strstr(b,"7403")) { stb_type = BRCM7401; break; }
-				else if (strstr(b,"7405")) { stb_type = BRCM7405; break; }
-				else if (strstr(b,"7413")) { stb_type = BRCM7405; break; }
-				else if (strstr(b,"7335")) { stb_type = BRCM7335; break; }
-				else if (strstr(b,"7325")) { stb_type = BRCM7325; break; }
-				else if (strstr(b,"7346")) { stb_type = BRCM7346; break; }
-				else if (strstr(b,"7358")) { stb_type = BRCM7358; break; }
-				else if (strstr(b,"73625")) { stb_type = BRCM73625; break; }
-				else if (strstr(b,"7362")) { stb_type = BRCM7362; break; }
-				else if (strstr(b,"7241")) { stb_type = BRCM7241; break; }
-				else if (strstr(b,"7251")) { stb_type = BRCM7251; break; }
-				else if (strstr(b,"7252S") || strstr(b,"7252s")) { stb_type = BRCM7252S; break; }
-				else if (strstr(b,"7252")) { stb_type = BRCM7252; break; }
-				else if (strstr(b,"7278")) { stb_type = BRCM7278; break; }
-				else if (strstr(b,"73565")) { stb_type = BRCM73565; break; }
-				else if (strstr(b,"7356")) { stb_type = BRCM7356; break; }
-				else if (strstr(b,"7424")) { stb_type = BRCM7424; break; }
-				else if (strstr(b,"7425")) { stb_type = BRCM7425; break; }
-				else if (strstr(b,"7435")) { stb_type = BRCM7435; break; }
-				else if (strstr(b,"7444")) { stb_type = BRCM7444; break; }
-				else if (strstr(b,"7552")) { stb_type = BRCM7552; break; }
-				else if (strstr(b,"7581")) { stb_type = BRCM7581; break; }
-				else if (strstr(b,"7583")) { stb_type = BRCM7583; break; }
-				else if (strstr(b,"72604")) { stb_type = BRCM72604; break; }
-				else if (strstr(b,"75845")) { stb_type = BRCM75845; break; }
-				else if (strstr(b,"7584")) { stb_type = BRCM7584; break; }
-				else if (strstr(b,"7366")) { stb_type = BRCM7366; break; }
-				else if (strstr(b,"7376")) { stb_type = BRCM7366; break; }
-				else if (strstr(b,"hi3798") || strstr(b,"hi3716")) { stb_type = HISIL_ARM; break; }
-				else if (strstr(b,"3716mv410")) { stb_type = HISI_3716MV410; break; }
-				else if (strstr(b,"3716mv430")) { stb_type = HISI_3716MV430; break; }
-				else if (strstr(b,"3798cv200")) { stb_type = HISI_3798CV200; break; }
-				else if (strstr(b,"3798mv200")) { stb_type = HISI_3798MV200; break; }
-				else if (strstr(b,"3798mv300")) { stb_type = HISI_3798MV300; break; }
-				else if (strstr(b,"Meson-6") || strstr(b,"Meson-64")) { stb_type = WETEK; break; }
-			}
-			fclose(file);
-		}
-	}
-
-	if (stb_type == UNKNOWN)
-	{
-		FILE *file = fopen("/proc/stb/info/model", "r");
-		if (file)
-		{
-			char b[32];
-			while (fgets(b, sizeof(b), file))
-			{
-				if (strcasestr(b,"DM920")) { stb_type = BRCM7252S; if (!quiet) fprintf(stderr, "Detected Dreambox DM920 (BCM7252S)\n"); break; }
-				else if (strcasestr(b,"DM500HD") || strcasestr(b,"DM800SE") || strcasestr(b,"DM7020HD")) { stb_type = BRCM7405; break; }
-				else if (strcasestr(b,"DM7080") || strcasestr(b,"DM820")) { stb_type = BRCM7435; break; }
-				else if (strcasestr(b,"DM520") || strcasestr(b,"DM525")) { stb_type = BRCM73625; break; }
-				else if (strcasestr(b,"DM8000")) { stb_type = BRCM7400; break; }
-				else if (strcasestr(b,"DM800")) { stb_type = BRCM7401; break; }
-				else if (strcasestr(b,"DM900")) { stb_type = BRCM7439; break; }
-				else if (strcasestr(b,"ONE") || strcasestr(b,"TWO")) { stb_type = DMNEW; break; }
-			}
-			fclose(file);
-		}
-	}
-
-	if (stb_type == UNKNOWN)
-	{
-		fprintf(stderr, "unknown stb type we can only capture osd\n");
-		osd_only=1;
-	}
-
-	switch (stb_type)
-	{
-		case BRCM7400:
-			registeroffset = 0x10100000;
-			chr_luma_stride = 0x40;
-			chr_luma_register_offset = 0x20;
-			mem2memdma_register = 0x10c02000;
-			break;
-		case BRCM7401:
-			registeroffset = 0x10100000;
-			chr_luma_stride = 0x40;
-			chr_luma_register_offset = 0x20;
-			mem2memdma_register = 0;
-			break;
-		case BRCM7325:
-		case BRCM7405:
-			registeroffset = 0x10100000;
-			chr_luma_stride = 0x80;
-			chr_luma_register_offset = 0x20;
-			mem2memdma_register = 0;
-			break;
-		case BRCM7335:
-			registeroffset = 0x10100000;
-			chr_luma_stride = 0x40;
-			chr_luma_register_offset = 0x20;
-			mem2memdma_register = 0x10c01000;
-			break;
-		case BRCM7358:
-		case BRCM7362:
-		case BRCM73625:
-		case BRCM7366:
-		case BRCM7444:
-		case BRCM7552:
-		case BRCM7251:
-		case BRCM7252:
-		case BRCM7278:
-		case BRCM7581:
-		case BRCM7584:
-		case BRCM72604VU:
-		case BRCM75845:
-			registeroffset = 0x10600000;
-			chr_luma_stride = 0x40;
-			chr_luma_register_offset = 0x34;
-			mem2memdma_register = 0;
-			break;
-		case BRCM72604:
-		case BRCM7439DAGS:
-			registeroffset = 0xf0600000;
-			chr_luma_stride = 0x100;
-			chr_luma_register_offset = 0x34;
-			mem2memdma_register = 0;
-			break;
-		case BRCM7241:
-		case BRCM7583:
-		case BRCM7346:
-		case BRCM7356:
-		case BRCM73565:
-		case BRCM7424:
-		case BRCM7425:
-		case BRCM7435:
-			registeroffset = 0x10600000;
-			chr_luma_stride = 0x80;
-			chr_luma_register_offset = 0x34;
-			mem2memdma_register = 0;
-			break;
-		case BRCM7252S:
-		case BRCM7439:
-			registeroffset = 0xf0600000;
-			chr_luma_stride = 0x80;
-			chr_luma_register_offset = 0x34;
-			mem2memdma_register = 0;
-			break;
-		default:
-			break;
-	}
-
-	/* Option string includes 'F' for forced FFmpeg backend */
-	while ((c = getopt (argc, argv, "dhj:lbnopqr:svi:F")) != -1)
-	{
-		switch (c)
-		{
-			case 'h':
-			case '?':
-				fprintf(stderr,
-					"Usage: grab [commands] [filename]\n\n"
-					"command:\n"
-					"-o only grab osd (e2egl/framebuffer) when using this with png or bmp\n"
-					"   fileformat you will get a 32bit pic with alphachannel\n"
-					"-v only grab video\n"
-					"-i (video device) to grab video (default 0)\n"
-					"-d always use osd resolution (good for skinshots)\n"
-					"-n dont correct 16:9 aspect ratio\n"
-					"-r (size) resize to a fixed width, maximum: 1920, 3840 on e2egl/UHD boxes\n"
-					"-l always 4:3, create letterbox if 16:9\n"
-					"-b use bicubic picture resize (slow but smooth)\n"
-					"-j (quality) produce jpg files instead of bmp (quality 0-100)\n"
-					"-p produce png files instead of bmp\n"
-					"-q Quiet mode, don't output debug messages\n"
-					"-s write to stdout instead of a file\n"
-					"-F Force FFmpeg backend (useful for HEVC/4K content)\n"
-					"-h this help screen\n\n"
-					"If no command is given the complete picture will be grabbed.\n"
-					"If no filename is given /tmp/screenshot.[bmp/jpg/png] will be used.\n");
-				return 1;
-			case 'o':
-				osd_only=1;
-				video_only=0;
-				break;
-			case 'v':
-				video_only=1;
-				osd_only=0;
-				break;
-			case 'i':
-				video_dev=atoi(optarg);
-				break;
-			case 'd':
-				use_osd_res=1;
-				no_aspect=1;
-				break;
-			case 'q':
-				++quiet;
-				break;
-			case 'r':
-				width=atoi(optarg);
-				{
-					int max_resize_width = (stb_supports_uhd_grab_buffers() || e2egl_capture_available()) ? 3840 : 1920;
-					if (width > max_resize_width)
-					{
-						fprintf(stderr, "Error: -r (size) is limited to %d pixels!\n", max_resize_width);
-						return 1;
-					}
-				}
-				break;
-			case 's':
-				filename = NULL;
-				break;
-			case 'l':
-				use_letterbox=1;
-				break;
-			case 'b':
-				resize = &smooth_resize;
-				break;
-			case 'p':
-				use_png=1;
-				use_jpg=0;
-				if (filename)
-					filename = "/tmp/screenshot.png";
-				break;
-			case 'j':
-				use_jpg=1;
-				use_png=0;
-				jpg_quality=atoi(optarg);
-				if (filename)
-					filename = "/tmp/screenshot.jpg";
-				break;
-			case 'n':
-				no_aspect=1;
-				break;
-			case 'F':
-				use_ffmpeg_video_backend = 1;
-				if (!quiet)
-					fprintf(stderr, "Forcing FFmpeg backend per user request\n");
-				break;
-		}
-	}
-	if (optind < argc)
-		filename = argv[optind];
-
-	/* -F bypasses the auto-use heuristic entirely */
-	if (!osd_only)
-	{
-		int src_w = 0, src_h = 0;
-		int auto_ffmpeg = use_ffmpeg_video_backend ||
-		                  grab_ffmpeg_backend_should_autouse(&src_w, &src_h);
-		if (auto_ffmpeg)
-		{
-			use_ffmpeg_video_backend = 1;
-			if ((src_w > 1920 || src_h > 1080) && (!width || width > 1920))
-				width = 1920;
-			if (!quiet)
-				fprintf(stderr, "Using ffmpeg backend for Dream HEVC/UHD/SD video capture ...\n");
-		}
-	}
-
-	size_t mallocsize = 1920U * 1080U;
-
-	if (e2egl_capture_available() || stb_supports_uhd_grab_buffers())
-		mallocsize = E2EGL_CAPTURE_MAX_PIXELS;
-	else if (stb_type == VULCAN || stb_type == PALLAS)
-		mallocsize = 720U * 576U;
-
-	video = (unsigned char *)malloc(mallocsize * 3U);
-	osd = (unsigned char *)malloc(mallocsize * 4U);
-
-	if ((stb_type == VULCAN || stb_type == PALLAS) && width > 720)
-		mallocsize = (size_t)width * (size_t)(width * 0.8 + 1);
-
-	output = (unsigned char *)malloc(mallocsize * 4U);
-
-	if (!video || !osd || !output)
-	{
-		fprintf(stderr, "Out of memory while allocating capture buffers\n");
-		free(video);
-		free(osd);
-		free(output);
-		if (hisi_lib_msp)    dlclose(hisi_lib_msp);
-		if (hisi_lib_common) dlclose(hisi_lib_common);
-		return 1;
-	}
-
-	if (hisi_uses_composited_snapshot() && !video_only && !osd_only)
-	{
-		hisi_composited_all = 1;
-		if (!quiet)
-			fprintf(stderr, "HiSi 3798: using composed DISP snapshot for all-mode, skipping second OSD blend\n");
-	}
-
-	hisi_grab_request_video_only = video_only;
-
-	if (!video_only && !hisi_composited_all)
-		getosd(osd,&xres_o,&yres_o);
-
-	if (!video_only && !hisi_composited_all && (xres_o <= 0 || yres_o <= 0))
-	{
-		if (osd_only)
-		{
-			fprintf(stderr, "OSD grab failed or returned empty frame; not writing a fake 0x0 image\n");
-			free(video); free(osd); free(output);
-			if (hisi_lib_msp)    dlclose(hisi_lib_msp);
-			if (hisi_lib_common) dlclose(hisi_lib_common);
-			return 1;
-		}
-		fprintf(stderr, "OSD grab failed or returned empty frame; falling back to video-only screenshot\n");
-		video_only = 1;
-	}
-
-	if (!osd_only)
-	{
-		if (!quiet)
-			fprintf(stderr, "Grabbing Video ...\n");
-		if (use_ffmpeg_video_backend)
-		{
-			if (grab_ffmpeg_getvideo_frame(video, &xres_v, &yres_v, width, NULL) < 0)
-				fprintf(stderr, "ffmpeg backend failed; refusing unsafe raw HEVC/UHD/SD video grab\n");
-		}
-		else if (stb_type == BRCM7366 || stb_type == BRCM7251 || stb_type == BRCM7252 || stb_type == BRCM7444 || stb_type == BRCM72604VU || stb_type == BRCM7278 || stb_type == HISIL_ARM)
-		{
-			getvideo2(video, &xres_v,&yres_v);
-		}
-		else if (hisi_uses_chip_backend())
-		{
-			getvideo_hisi(video, &xres_v, &yres_v);
-		}
-		else
-		{
-			getvideo(video,&xres_v,&yres_v);
-		}
-	}
-
-	if (!osd_only && (xres_v <= 0 || yres_v <= 0))
-	{
-		if (video_only)
-		{
-			fprintf(stderr, "Video grab failed or returned empty frame; not writing a fake 0x0 image\n");
-			free(video); free(osd); free(output);
-			if (hisi_lib_msp)    dlclose(hisi_lib_msp);
-			if (hisi_lib_common) dlclose(hisi_lib_common);
-			return 1;
-		}
-		fprintf(stderr, "Video grab failed or returned empty frame; falling back to OSD-only screenshot\n");
-		osd_only = 1;
-	}
-
-	if (osd_only)
-	{
-		xres = xres_o;
-		yres = yres_o;
-		memcpy(output, osd, (size_t)xres * (size_t)yres * 4);
-		output_bytes = 4;
-		dst_left   = 0;
-		dst_top    = 0;
-		dst_width  = xres;
-		dst_height = yres;
-		goto post_merge;
-	}
-
-	if (hisi_composited_all)
-	{
-		if (xres_v <= 0 || yres_v <= 0)
-		{
-			fprintf(stderr, "HiSi 3798: composed snapshot failed, empty video frame\n");
-			xres = 0; yres = 0;
-		}
-		else
-		{
-			xres = xres_v;
-			yres = yres_v;
-			memcpy(output, video, (size_t)xres * (size_t)yres * 3U);
-			output_bytes = 3;
-		}
-		dst_left = 0; dst_top = 0;
-		dst_width = xres; dst_height = yres;
-		goto post_merge;
-	}
-
-	if (stb_type == VULCAN || stb_type == PALLAS)
-	{
-		fp = fopen("/proc/bus/bitstream","r");
-		if (fp)
-		{
-			while (fgets(buf,sizeof(buf),fp))
-				sscanf(buf,"A_RATIO: %d",&aspect);
-			fclose(fp);
-		}
-	}
-	else
-	{
-		fp = fopen("/proc/stb/vmpeg/0/aspect", "r");
-		if (fp) { while (fgets(buf,sizeof(buf), fp)) sscanf(buf,"%x",&aspect); fclose(fp); }
-		fp = fopen("/proc/stb/vmpeg/0/dst_width", "r");
-		if (fp) { while (fgets(buf,sizeof(buf), fp)) sscanf(buf,"%x",&dst_width); fclose(fp); }
-		fp = fopen("/proc/stb/vmpeg/0/dst_height", "r");
-		if (fp) { while (fgets(buf,sizeof(buf), fp)) sscanf(buf,"%x",&dst_height); fclose(fp); }
-		fp = fopen("/proc/stb/vmpeg/0/dst_top", "r");
-		if (fp) { while (fgets(buf,sizeof(buf), fp)) sscanf(buf,"%x",&dst_top); fclose(fp); }
-		fp = fopen("/proc/stb/vmpeg/0/dst_left", "r");
-		if (fp) { while (fgets(buf,sizeof(buf), fp)) sscanf(buf,"%x",&dst_left); fclose(fp); }
-		if (dst_width == 720) dst_width = 0;
-		if (dst_height == 576) dst_height = 0;
-	}
-
-	if (video_only)
-	{
-		xres=xres_v; yres=yres_v;
-	}
-	else if (osd_only)
-	{
-		xres=xres_o; yres=yres_o;
-	}
-	else if (xres_o == xres_v && yres_o == yres_v && !dst_top && !dst_left && !dst_width && !dst_height)
-	{
-		xres=xres_v; yres=yres_v;
-	}
-	else
-	{
-		if (xres_v > xres_o && !use_osd_res && (width == 0 || width > xres_o)) {
-			xres = xres_v; yres = yres_v;
-		} else {
-			xres = xres_o; yres = yres_o;
-		}
-
-		if (stb_type == DMNEW) {
-			if (aml_pick_axis(&dst_left, &dst_top, &dst_width, &dst_height)) {
-				clamp_rect(&dst_left, &dst_top, &dst_width, &dst_height, xres, yres);
-				dst_is_osd_pixels = 1;
-				aml_axis_active   = 1;
-				if (axis_debug)
-					fprintf(stderr, "[AML axis] dst=%d,%d %dx%d shot=%dx%d\n", dst_left, dst_top, dst_width, dst_height, xres, yres);
-			}
-		}
-		if (dst_top || dst_left || dst_width || dst_height)
-		{
-			if (!dst_is_osd_pixels) {
-				if (dst_width == 0)  dst_width  = 720;
-				if (dst_height == 0) dst_height = 576;
-				dst_top    = (int)((long long)dst_top    * yres / 576);
-				dst_height = (int)((long long)dst_height * yres / 576);
-				dst_left   = (int)((long long)dst_left   * xres / 720);
-				dst_width  = (int)((long long)dst_width  * xres / 720);
-			}
-		}
-		else
-		{
-			dst_left = 0; dst_top = 0;
-			dst_width = xres; dst_height = yres;
-		}
-
-		vbuf_w = dst_width;
-		vbuf_h = dst_height;
-
-		if (xres_o != xres || yres_o != yres)
-		{
-			if (!quiet)
-				fprintf(stderr, "Resizing OSD to %d x %d ...\n", xres, yres);
-			resize(osd, output, xres_o, yres_o, xres, yres, 4);
-			memcpy(osd, output, xres * yres * 4);
-		}
-
-		if (xres_v != vbuf_w || yres_v != vbuf_h)
-		{
-			if (!quiet)
-				fprintf(stderr, "Resizing Video to %d x %d ...\n", vbuf_w, vbuf_h);
-			resize(video, output, xres_v, yres_v, vbuf_w, vbuf_h, 3);
-			memcpy(video, output, vbuf_w * vbuf_h * 3);
-			xres_v = vbuf_w;
-			yres_v = vbuf_h;
-		}
-	}
-
-	if (video_only)
-	{
-		memcpy(output,video,xres*yres*3);
-	}
-	else
-	{
-		if (!quiet)
-			fprintf(stderr, "Merge Video with Framebuffer ...\n");
-		if (aml_axis_active && axis_debug)
-			fprintf(stderr, "[combine] dst=%d,%d %dx%d  vbuf=%dx%d  out=%dx%d\n", dst_left, dst_top, dst_width, dst_height, vbuf_w, vbuf_h, xres, yres);
-		combine(output, video, osd, dst_left, dst_top, vbuf_w ? vbuf_w : xres, vbuf_h ? vbuf_h : yres, xres, yres);
-	}
-
-post_merge:
-
-	if (width && width != xres)
-	{
-		if (!quiet)
-			fprintf(stderr, "Resizing Screenshot to %d x %d ...\n",width,yres*width/xres);
-		resize(output,osd,xres,yres,width,(yres*width/xres),output_bytes);
-		yres=yres*width/xres;
-		xres=width;
-		memcpy(output,osd,xres*yres*output_bytes);
-	}
-
-	if (!no_aspect && aspect == 3 && ((float)xres/(float)yres)<1.5)
-	{
-		if (!quiet)
-			fprintf(stderr, "Correct aspect ratio to 16:9 ...\n");
-		resize(output,osd,xres,yres,xres,yres/1.42,output_bytes);
-		yres/=1.42;
-		memcpy(output,osd,xres*yres*output_bytes);
-	}
-
-	if (use_letterbox && xres*0.8 != yres && xres*0.8 <= 1080)
-	{
-		int yres_neu;
-		yres_neu=xres*0.8;
-		if (!quiet)
-			fprintf(stderr, "Create letterbox %d x %d ...\n",xres,yres_neu);
-		if (yres_neu > yres)
-		{
-			int ofs;
-			ofs=(yres_neu-yres)>>1;
-			memmove(output+ofs*xres*output_bytes,output,xres*yres*output_bytes);
-			memset(output,0,ofs*xres*output_bytes);
-			memset(output+ofs*xres*3+xres*yres*output_bytes,0,ofs*xres*output_bytes);
-		}
-		yres=yres_neu;
-	}
-
-	if (!quiet)
-		fprintf(stderr, "Saving %d bit %s ...\n",(use_jpg?3*8:output_bytes*8), filename ? filename : "<stdout>");
-	FILE *fd2;
-	if (filename)
-	{
-		fd2 = fopen(filename, "wb");
-		if (!fd2)
-		{
-			fprintf(stderr, "Failed to open '%s' for output\n", filename);
-			return 1;
-		}
-	}
-	else
-		fd2 = stdout;
-
-	if (!use_png && !use_jpg)
-	{
-		unsigned char hdr[14 + 40];
-		int i = 0;
-#define PUT32(x) hdr[i++] = ((x)&0xFF); hdr[i++] = (((x)>>8)&0xFF); hdr[i++] = (((x)>>16)&0xFF); hdr[i++] = (((x)>>24)&0xFF);
-#define PUT16(x) hdr[i++] = ((x)&0xFF); hdr[i++] = (((x)>>8)&0xFF);
-#define PUT8(x) hdr[i++] = ((x)&0xFF);
-		PUT8('B'); PUT8('M');
-		PUT32((((xres * yres) * 3 + 3) &~ 3) + 14 + 40);
-		PUT16(0); PUT16(0); PUT32(14 + 40);
-		PUT32(40); PUT32(xres); PUT32(yres);
-		PUT16(1);
-		PUT16(output_bytes*8);
-		PUT32(0); PUT32(0); PUT32(0); PUT32(0); PUT32(0); PUT32(0);
-#undef PUT32
-#undef PUT16
-#undef PUT8
-		fwrite(hdr, 1, i, fd2);
-
-		int y;
-		for (y=yres-1; y>=0 ; y-=1)
-			fwrite(output+(y*xres*output_bytes),xres*output_bytes,1,fd2);
-	}
-	else if (use_png)
-	{
-		png_bytep *row_pointers;
-		png_structp png_ptr;
-		png_infop info_ptr;
-
-		png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, (png_voidp)NULL, (png_error_ptr)NULL, (png_error_ptr)NULL);
-		info_ptr = png_create_info_struct(png_ptr);
-		png_init_io(png_ptr, fd2);
-
-		row_pointers=(png_bytep*)malloc(sizeof(png_bytep)*yres);
-
-		int y;
-		for (y=0; y<yres; y++)
-			row_pointers[y]=output+(y*xres*output_bytes);
-
-		png_set_bgr(png_ptr);
-		png_set_IHDR(png_ptr, info_ptr, xres, yres, 8, ((output_bytes<4)?PNG_COLOR_TYPE_RGB:PNG_COLOR_TYPE_RGBA) , PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_BASE, PNG_FILTER_TYPE_BASE);
-		png_write_info(png_ptr, info_ptr);
-		png_write_image(png_ptr, row_pointers);
-		png_write_end(png_ptr, info_ptr);
-		png_destroy_write_struct(&png_ptr, &info_ptr);
-
-		free(row_pointers);
-	}
-	else
-	{
-		const int row_stride = xres * output_bytes;
-		if (output_bytes == 3)
-		{
-			int y;
-			#pragma omp parallel for shared(output)
-			for (y=0; y<yres; y++)
-			{
-				int xres1=y*xres*3;
-				int xres2=xres1+2;
-				int x;
-				for (x=0; x<xres; x++)
-				{
-					int x2=x*3;
-					SWAP(output[x2+xres1],output[x2+xres2]);
-				}
-			}
-		}
-		else
-		{
-			int y;
-			#pragma omp parallel for shared(output)
-			for (y=0; y<yres; y++)
-			{
-				unsigned char *scanline = output + (y * row_stride);
-				int x;
-				for (x=0; x<xres; x++)
-				{
-					const int xs = x * 4;
-					const int xd = x * 3;
-					scanline[xd + 0] = scanline[xs + 2];
-					scanline[xd + 1] = scanline[xs + 1];
-					scanline[xd + 2] = scanline[xs + 0];
-				}
-			}
-		}
-
-		struct jpeg_compress_struct cinfo;
-		struct jpeg_error_mgr jerr;
-		JSAMPROW row_pointer[1];
-		cinfo.err = jpeg_std_error(&jerr);
-
-		jpeg_create_compress(&cinfo);
-		jpeg_stdio_dest(&cinfo, fd2);
-		cinfo.image_width = xres;
-		cinfo.image_height = yres;
-		cinfo.input_components = 3;
-		cinfo.in_color_space = JCS_RGB;
-		cinfo.dct_method = JDCT_IFAST;
-		jpeg_set_defaults(&cinfo);
-		jpeg_set_quality(&cinfo,jpg_quality, TRUE);
-		jpeg_start_compress(&cinfo, TRUE);
-		while (cinfo.next_scanline < cinfo.image_height)
-		{
-			row_pointer[0] = & output[cinfo.next_scanline * row_stride];
-			(void) jpeg_write_scanlines(&cinfo, row_pointer, 1);
-		}
-		jpeg_finish_compress(&cinfo);
-		jpeg_destroy_compress(&cinfo);
-	}
-
-	if (filename)
-		fclose(fd2);
-
-	if (!quiet)
-		fprintf(stderr, "... Done !\n");
-
-	free(video);
-	free(osd);
-	free(output);
-	if (hisi_lib_msp)    dlclose(hisi_lib_msp);
-	if (hisi_lib_common) dlclose(hisi_lib_common);
-	return 0;
-}
-
-/* ---- HiSilicon backend stubs ---- */
-static int hisi_uses_chip_backend(void) { return 0; }
-static int hisi_uses_composited_snapshot(void) { return 0; }
-void getvideo_hisi(unsigned char *video, int *xres, int *yres)
-{
-	(void)video;
-	*xres = 0;
-	*yres = 0;
-}
+// bicubic pixmap resizing
 
 void smooth_resize(const unsigned char *source, unsigned char *dest, int xsource, int ysource, int xdest, int ydest, int colors)
 {
-	const unsigned int xs = xsource;
-	const unsigned int ys = ysource;
-	const unsigned int xd = xdest;
-	const unsigned int yd = ydest;
+	const unsigned int xs = xsource; // x-resolution source
+	const unsigned int ys = ysource; // y-resolution source
+	const unsigned int xd = xdest; // x-resolution destination
+	const unsigned int yd = ydest; // y-resolution destination
 
 	unsigned int sx1[xd];
 	unsigned int sx2[xd];
+	// get x scale factor, use bitshifting to get rid of floats
 	const int fx=((xs-1)<<16)/xd;
+	// get y scale factor, use bitshifting to get rid of floats
 	const int fy=((ys-1)<<16)/yd;
 
 	{
+		// pre calculating sx1/sx2 for faster resizing
 		int x;
 		for (x=0; x<xd; x++)
 		{
-			sx1[x]=(fx*x)>>16;
+			// first x source pixel for calculating destination pixel
+			sx1[x]=(fx*x)>>16; //floor()
+
+			// last x source pixel for calculating destination pixel
 			sx2[x]=sx1[x]+(fx>>16);
-			if (fx & 0x7FFF) sx2[x]++;
+			if (fx & 0x7FFF) //ceil()
+				sx2[x]++;
 		}
 	}
 
+	// Scale
 	int y;
 	#pragma omp parallel for shared(sx1, sx2, source, dest)
 	for (y=0; y<yd; y++)
@@ -3046,17 +5734,23 @@ void smooth_resize(const unsigned char *source, unsigned char *dest, int xsource
 		unsigned int c,tmp_i;
 		int t, t1;
 
-		const unsigned int sy1=(fy*y)>>16;
+		// first y source pixel for calculating destination pixel
+		const unsigned int sy1=(fy*y)>>16; //floor()
+		// last y source pixel for calculating destination pixel
 		unsigned int sy2=sy1+(fy>>16);
-		if (fy & 0x7FFF) sy2++;
+		if (fy & 0x7FFF) //ceil()
+			sy2++;
 
 		int x;
 		for (x=0; x<xd; x++)
 		{
+			// we do this for every color
 			for (c=0; c<colors; c++)
 			{
+				// calculationg destination pixel
 				tmp_i=0;
 				dpixel=0;
+
 				for (t1=sy1; t1<sy2; t1++)
 				{
 					for (t=sx1[x]; t<=sx2[x]; t++)
@@ -3065,12 +5759,14 @@ void smooth_resize(const unsigned char *source, unsigned char *dest, int xsource
 						dpixel++;
 					}
 				}
+				// writing calculated pixel into destination pixmap
 				dest[(x*colors)+c+(y*xd*colors)]=tmp_i/dpixel;
 			}
 		}
 	}
 }
 
+// "nearest neighbor" pixmap resizing
 void fast_resize(const unsigned char *source, unsigned char *dest, int xsource, int ysource, int xdest, int ydest, int colors)
 {
     const int x_ratio = (int)((xsource<<16)/xdest);
@@ -3094,6 +5790,7 @@ void fast_resize(const unsigned char *source, unsigned char *dest, int xsource, 
     }
 }
 
+// combining pixmaps by using an alphamap
 void combine(unsigned char *output, const unsigned char *video, const unsigned char *osd, int vleft, int vtop, int vwidth, int vheight, int xres, int yres)
 {
 	const int vbottom = vtop + vheight;
@@ -3110,7 +5807,7 @@ void combine(unsigned char *output, const unsigned char *video, const unsigned c
 			output[vpos1++] =  (( osd[pos1++] * osd[apos] ) ) >>8;
 			output[vpos1++] =  (( osd[pos1++] * osd[apos] ) ) >>8;
 			output[vpos1++] =  (( osd[pos1++] * osd[apos] ) ) >>8;
-			pos1++;
+			pos1++; // skip alpha byte
 		}
 	}
 	#pragma omp parallel for
@@ -3125,7 +5822,7 @@ void combine(unsigned char *output, const unsigned char *video, const unsigned c
 			output[vpos1++] =  (( osd[pos1++] * osd[apos] ) ) >>8;
 			output[vpos1++] =  (( osd[pos1++] * osd[apos] ) ) >>8;
 			output[vpos1++] =  (( osd[pos1++] * osd[apos] ) ) >>8;
-			pos1++;
+			pos1++; // skip alpha byte
 		}
 		for (x = vleft; x < vright; x++)
 		{
@@ -3135,7 +5832,7 @@ void combine(unsigned char *output, const unsigned char *video, const unsigned c
 			output[vpos1++] =  ( ( video[pixel + 0] * a2 ) + ( osd[pos1++] * osd[apos] ) ) >>8;
 			output[vpos1++] =  ( ( video[pixel + 1] * a2 ) + ( osd[pos1++] * osd[apos] ) ) >>8;
 			output[vpos1++] =  ( ( video[pixel + 2] * a2 ) + ( osd[pos1++] * osd[apos] ) ) >>8;
-			pos1++;
+			pos1++; // skip alpha byte
 		}
 		for (x = vright; x < xres; x++)
 		{
@@ -3143,7 +5840,7 @@ void combine(unsigned char *output, const unsigned char *video, const unsigned c
 			output[vpos1++] =  (( osd[pos1++] * osd[apos] ) ) >>8;
 			output[vpos1++] =  (( osd[pos1++] * osd[apos] ) ) >>8;
 			output[vpos1++] =  (( osd[pos1++] * osd[apos] ) ) >>8;
-			pos1++;
+			pos1++; // skip alpha byte
 		}
 	}
 	for (y = vbottom; y < yres; y++)
@@ -3157,7 +5854,7 @@ void combine(unsigned char *output, const unsigned char *video, const unsigned c
 			output[vpos1++] =  (( osd[pos1++] * osd[apos] ) ) >>8;
 			output[vpos1++] =  (( osd[pos1++] * osd[apos] ) ) >>8;
 			output[vpos1++] =  (( osd[pos1++] * osd[apos] ) ) >>8;
-			pos1++;
+			pos1++; // skip alpha byte
 		}
 	}
 }
